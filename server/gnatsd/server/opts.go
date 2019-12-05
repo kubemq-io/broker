@@ -24,7 +24,9 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -107,6 +109,8 @@ type LeafNodeOpts struct {
 	Port              int           `json:"port,omitempty"`
 	Username          string        `json:"-"`
 	Password          string        `json:"-"`
+	Account           string        `json:"-"`
+	Users             []*User       `json:"-"`
 	AuthTimeout       float64       `json:"auth_timeout,omitempty"`
 	TLSConfig         *tls.Config   `json:"-"`
 	TLSTimeout        float64       `json:"tls_timeout,omitempty"`
@@ -121,6 +125,7 @@ type LeafNodeOpts struct {
 	// Not exported, for tests.
 	resolver    netResolver
 	dialTimeout time.Duration
+	loopDelay   time.Duration
 }
 
 // RemoteLeafOpts are options for connecting to a remote server as a leaf node.
@@ -137,57 +142,59 @@ type RemoteLeafOpts struct {
 // NOTE: This structure is no longer used for monitoring endpoints
 // and json tags are deprecated and may be removed in the future.
 type Options struct {
-	ConfigFile       string        `json:"-"`
-	Host             string        `json:"addr"`
-	Port             int           `json:"port"`
-	ClientAdvertise  string        `json:"-"`
-	Trace            bool          `json:"-"`
-	Debug            bool          `json:"-"`
-	NoLog            bool          `json:"-"`
-	NoSigs           bool          `json:"-"`
-	NoSublistCache   bool          `json:"-"`
-	Logtime          bool          `json:"-"`
-	MaxConn          int           `json:"max_connections"`
-	MaxSubs          int           `json:"max_subscriptions,omitempty"`
-	Nkeys            []*NkeyUser   `json:"-"`
-	Users            []*User       `json:"-"`
-	Accounts         []*Account    `json:"-"`
-	SystemAccount    string        `json:"-"`
-	AllowNewAccounts bool          `json:"-"`
-	Username         string        `json:"-"`
-	Password         string        `json:"-"`
-	Authorization    string        `json:"-"`
-	PingInterval     time.Duration `json:"ping_interval"`
-	MaxPingsOut      int           `json:"ping_max"`
-	HTTPHost         string        `json:"http_host"`
-	HTTPPort         int           `json:"http_port"`
-	HTTPSPort        int           `json:"https_port"`
-	AuthTimeout      float64       `json:"auth_timeout"`
-	MaxControlLine   int32         `json:"max_control_line"`
-	MaxPayload       int32         `json:"max_payload"`
-	MaxPending       int64         `json:"max_pending"`
-	Cluster          ClusterOpts   `json:"cluster,omitempty"`
-	Gateway          GatewayOpts   `json:"gateway,omitempty"`
-	LeafNode         LeafNodeOpts  `json:"leaf,omitempty"`
-	ProfPort         int           `json:"-"`
-	PidFile          string        `json:"-"`
-	PortsFileDir     string        `json:"-"`
-	LogFile          string        `json:"-"`
-	Syslog           bool          `json:"-"`
-	RemoteSyslog     string        `json:"-"`
-	Routes           []*url.URL    `json:"-"`
-	RoutesStr        string        `json:"-"`
-	TLSTimeout       float64       `json:"tls_timeout"`
-	TLS              bool          `json:"-"`
-	TLSVerify        bool          `json:"-"`
-	TLSMap           bool          `json:"-"`
-	TLSCert          string        `json:"-"`
-	TLSKey           string        `json:"-"`
-	TLSCaCert        string        `json:"-"`
-	TLSConfig        *tls.Config   `json:"-"`
-	WriteDeadline    time.Duration `json:"-"`
-	MaxClosedClients int           `json:"-"`
-	LameDuckDuration time.Duration `json:"-"`
+	ConfigFile            string        `json:"-"`
+	ServerName            string        `json:"server_name"`
+	Host                  string        `json:"addr"`
+	Port                  int           `json:"port"`
+	ClientAdvertise       string        `json:"-"`
+	Trace                 bool          `json:"-"`
+	Debug                 bool          `json:"-"`
+	NoLog                 bool          `json:"-"`
+	NoSigs                bool          `json:"-"`
+	NoSublistCache        bool          `json:"-"`
+	DisableShortFirstPing bool          `json:"-"`
+	Logtime               bool          `json:"-"`
+	MaxConn               int           `json:"max_connections"`
+	MaxSubs               int           `json:"max_subscriptions,omitempty"`
+	Nkeys                 []*NkeyUser   `json:"-"`
+	Users                 []*User       `json:"-"`
+	Accounts              []*Account    `json:"-"`
+	SystemAccount         string        `json:"-"`
+	AllowNewAccounts      bool          `json:"-"`
+	Username              string        `json:"-"`
+	Password              string        `json:"-"`
+	Authorization         string        `json:"-"`
+	PingInterval          time.Duration `json:"ping_interval"`
+	MaxPingsOut           int           `json:"ping_max"`
+	HTTPHost              string        `json:"http_host"`
+	HTTPPort              int           `json:"http_port"`
+	HTTPSPort             int           `json:"https_port"`
+	AuthTimeout           float64       `json:"auth_timeout"`
+	MaxControlLine        int32         `json:"max_control_line"`
+	MaxPayload            int32         `json:"max_payload"`
+	MaxPending            int64         `json:"max_pending"`
+	Cluster               ClusterOpts   `json:"cluster,omitempty"`
+	Gateway               GatewayOpts   `json:"gateway,omitempty"`
+	LeafNode              LeafNodeOpts  `json:"leaf,omitempty"`
+	ProfPort              int           `json:"-"`
+	PidFile               string        `json:"-"`
+	PortsFileDir          string        `json:"-"`
+	LogFile               string        `json:"-"`
+	Syslog                bool          `json:"-"`
+	RemoteSyslog          string        `json:"-"`
+	Routes                []*url.URL    `json:"-"`
+	RoutesStr             string        `json:"-"`
+	TLSTimeout            float64       `json:"tls_timeout"`
+	TLS                   bool          `json:"-"`
+	TLSVerify             bool          `json:"-"`
+	TLSMap                bool          `json:"-"`
+	TLSCert               string        `json:"-"`
+	TLSKey                string        `json:"-"`
+	TLSCaCert             string        `json:"-"`
+	TLSConfig             *tls.Config   `json:"-"`
+	WriteDeadline         time.Duration `json:"-"`
+	MaxClosedClients      int           `json:"-"`
+	LameDuckDuration      time.Duration `json:"-"`
 	// MaxTracedMsgLen is the maximum printable length for traced messages.
 	MaxTracedMsgLen int `json:"-"`
 
@@ -220,6 +227,7 @@ type Options struct {
 
 	// private fields, used for testing
 	gatewaysSolicitDelay time.Duration
+	routeProto           int
 }
 
 type netResolver interface {
@@ -288,6 +296,7 @@ type authorization struct {
 	user  string
 	pass  string
 	token string
+	acc   string
 	// Multiple Nkeys/Users
 	nkeys              []*NkeyUser
 	users              []*User
@@ -441,6 +450,8 @@ func (o *Options) ProcessConfigFile(configFile string) error {
 			o.ClientAdvertise = v.(string)
 		case "port":
 			o.Port = int(v.(int64))
+		case "server_name":
+			o.ServerName = v.(string)
 		case "host", "net":
 			o.Host = v.(string)
 		case "debug":
@@ -1039,20 +1050,21 @@ func parseLeafNodes(v interface{}, opts *Options, errors *[]error, warnings *[]e
 		case "host", "net":
 			opts.LeafNode.Host = mv.(string)
 		case "authorization":
-			auth, err := parseAuthorization(tk, opts, errors, warnings)
+			auth, err := parseLeafAuthorization(tk, errors, warnings)
 			if err != nil {
-				*errors = append(*errors, err)
-				continue
-			}
-			if auth.users != nil {
-				err := &configErr{tk, fmt.Sprintf("Leafnode authorization does not allow multiple users")}
 				*errors = append(*errors, err)
 				continue
 			}
 			opts.LeafNode.Username = auth.user
 			opts.LeafNode.Password = auth.pass
 			opts.LeafNode.AuthTimeout = auth.timeout
-
+			opts.LeafNode.Account = auth.acc
+			opts.LeafNode.Users = auth.users
+			// Validate user info config for leafnode authorization
+			if err := validateLeafNodeAuthOptions(opts); err != nil {
+				*errors = append(*errors, &configErr{tk, err.Error()})
+				continue
+			}
 		case "remotes":
 			// Parse the remote options here.
 			remotes, err := parseRemoteLeafNodes(mv, errors, warnings)
@@ -1095,6 +1107,114 @@ func parseLeafNodes(v interface{}, opts *Options, errors *[]error, warnings *[]e
 	return nil
 }
 
+// This is the authorization parser adapter for the leafnode's
+// authorization config.
+func parseLeafAuthorization(v interface{}, errors *[]error, warnings *[]error) (*authorization, error) {
+	var (
+		am   map[string]interface{}
+		tk   token
+		auth = &authorization{}
+	)
+	_, v = unwrapValue(v)
+	am = v.(map[string]interface{})
+	for mk, mv := range am {
+		tk, mv = unwrapValue(mv)
+		switch strings.ToLower(mk) {
+		case "user", "username":
+			auth.user = mv.(string)
+		case "pass", "password":
+			auth.pass = mv.(string)
+		case "timeout":
+			at := float64(1)
+			switch mv := mv.(type) {
+			case int64:
+				at = float64(mv)
+			case float64:
+				at = mv
+			}
+			auth.timeout = at
+		case "users":
+			users, err := parseLeafUsers(tk, errors, warnings)
+			if err != nil {
+				*errors = append(*errors, err)
+				continue
+			}
+			auth.users = users
+		case "account":
+			auth.acc = mv.(string)
+		default:
+			if !tk.IsUsedVariable() {
+				err := &unknownConfigFieldErr{
+					field: mk,
+					configErr: configErr{
+						token: tk,
+					},
+				}
+				*errors = append(*errors, err)
+			}
+			continue
+		}
+	}
+	return auth, nil
+}
+
+// This is a trimmed down version of parseUsers that is adapted
+// for the users possibly defined in the authorization{} section
+// of leafnodes {}.
+func parseLeafUsers(mv interface{}, errors *[]error, warnings *[]error) ([]*User, error) {
+	var (
+		tk    token
+		users = []*User{}
+	)
+	tk, mv = unwrapValue(mv)
+	// Make sure we have an array
+	uv, ok := mv.([]interface{})
+	if !ok {
+		return nil, &configErr{tk, fmt.Sprintf("Expected users field to be an array, got %v", mv)}
+	}
+	for _, u := range uv {
+		tk, u = unwrapValue(u)
+		// Check its a map/struct
+		um, ok := u.(map[string]interface{})
+		if !ok {
+			err := &configErr{tk, fmt.Sprintf("Expected user entry to be a map/struct, got %v", u)}
+			*errors = append(*errors, err)
+			continue
+		}
+		user := &User{}
+		for k, v := range um {
+			tk, v = unwrapValue(v)
+			switch strings.ToLower(k) {
+			case "user", "username":
+				user.Username = v.(string)
+			case "pass", "password":
+				user.Password = v.(string)
+			case "account":
+				// We really want to save just the account name here, but
+				// the User object is *Account. So we create an account object
+				// but it won't be registered anywhere. The server will just
+				// use opts.LeafNode.Users[].Account.Name. Alternatively
+				// we need to create internal objects to store u/p and account
+				// name and have a server structure to hold that.
+				user.Account = NewAccount(v.(string))
+			default:
+				if !tk.IsUsedVariable() {
+					err := &unknownConfigFieldErr{
+						field: k,
+						configErr: configErr{
+							token: tk,
+						},
+					}
+					*errors = append(*errors, err)
+					continue
+				}
+			}
+		}
+		users = append(users, user)
+	}
+	return users, nil
+}
+
 func parseRemoteLeafNodes(v interface{}, errors *[]error, warnings *[]error) ([]*RemoteLeafOpts, error) {
 	tk, v := unwrapValue(v)
 	ra, ok := v.([]interface{})
@@ -1134,7 +1254,12 @@ func parseRemoteLeafNodes(v interface{}, errors *[]error, warnings *[]error) ([]
 			case "account", "local":
 				remote.LocalAccount = v.(string)
 			case "creds", "credentials":
-				remote.Credentials = v.(string)
+				p, err := expandPath(v.(string))
+				if err != nil {
+					*errors = append(*errors, &configErr{tk, err.Error()})
+					continue
+				}
+				remote.Credentials = p
 			case "tls":
 				tc, err := parseTLS(tk)
 				if err != nil {
@@ -1563,6 +1688,7 @@ func parseAccountImports(v interface{}, acc *Account, errors, warnings *[]error)
 
 	var services []*importService
 	var streams []*importStream
+	svcSubjects := map[string]*importService{}
 
 	for _, v := range ims {
 		// Should have stream or service
@@ -1572,6 +1698,15 @@ func parseAccountImports(v interface{}, acc *Account, errors, warnings *[]error)
 			continue
 		}
 		if service != nil {
+			if dup := svcSubjects[service.to]; dup != nil {
+				tk, _ := unwrapValue(v)
+				err := &configErr{tk,
+					fmt.Sprintf("Duplicate service import subject %q, previously used in import for account %q, subject %q",
+						service.to, dup.an, dup.sub)}
+				*errors = append(*errors, err)
+				continue
+			}
+			svcSubjects[service.to] = service
 			service.acc = acc
 			services = append(services, service)
 		}
@@ -3099,4 +3234,42 @@ func maybeReadPidFile(pidStr string) string {
 		return string(b)
 	}
 	return pidStr
+}
+
+func homeDir() (string, error) {
+	if runtime.GOOS == "windows" {
+		homeDrive, homePath := os.Getenv("HOMEDRIVE"), os.Getenv("HOMEPATH")
+		userProfile := os.Getenv("USERPROFILE")
+
+		home := filepath.Join(homeDrive, homePath)
+		if homeDrive == "" || homePath == "" {
+			if userProfile == "" {
+				return "", errors.New("nats: failed to get home dir, require %HOMEDRIVE% and %HOMEPATH% or %USERPROFILE%")
+			}
+			home = userProfile
+		}
+
+		return home, nil
+	}
+
+	home := os.Getenv("HOME")
+	if home == "" {
+		return "", errors.New("failed to get home dir, require $HOME")
+	}
+	return home, nil
+}
+
+func expandPath(p string) (string, error) {
+	p = os.ExpandEnv(p)
+
+	if !strings.HasPrefix(p, "~") {
+		return p, nil
+	}
+
+	home, err := homeDir()
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(home, p[1:]), nil
 }

@@ -36,9 +36,9 @@ import (
 	"github.com/kubemq-io/broker/server/stan/stores"
 	"github.com/kubemq-io/broker/server/stan/test"
 
-	_ "github.com/go-sql-driver/mysql"                             // mysql driver
+	_ "github.com/go-sql-driver/mysql"                                        // mysql driver
 	_ "github.com/kubemq-io/broker/server/stan/stores/pqdeadlines" // wrapper for postgres that gives read/write deadlines
-	_ "github.com/lib/pq"                                          // postgres driver
+	_ "github.com/lib/pq"                                                     // postgres driver
 )
 
 const (

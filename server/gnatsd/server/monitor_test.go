@@ -32,8 +32,8 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/kubemq-io/broker/client/nats"
 	"github.com/nats-io/jwt"
+	"github.com/kubemq-io/broker/client/nats"
 	"github.com/nats-io/nkeys"
 )
 
@@ -43,12 +43,13 @@ const CLUSTER_PORT = -1
 
 func DefaultMonitorOptions() *Options {
 	return &Options{
-		Host:     "127.0.0.1",
-		Port:     CLIENT_PORT,
-		HTTPHost: "127.0.0.1",
-		HTTPPort: MONITOR_PORT,
-		NoLog:    true,
-		NoSigs:   true,
+		Host:       "127.0.0.1",
+		Port:       CLIENT_PORT,
+		HTTPHost:   "127.0.0.1",
+		HTTPPort:   MONITOR_PORT,
+		ServerName: "monitor_server",
+		NoLog:      true,
+		NoSigs:     true,
 	}
 }
 
@@ -210,6 +211,9 @@ func TestHandleVarz(t *testing.T) {
 		if v.Subscriptions != 0 {
 			t.Fatalf("Expected Subscriptions of 0, got %v\n", v.Subscriptions)
 		}
+		if v.Name != "monitor_server" {
+			t.Fatal("Expected ServerName to be 'monitor_server'")
+		}
 	}
 
 	// Test JSONP
@@ -324,8 +328,10 @@ func TestConnz(t *testing.T) {
 		if ci.Idle == "" {
 			t.Fatal("Expected Idle to be valid\n")
 		}
-		if ci.RTT != "" {
-			t.Fatal("Expected RTT to NOT be set for new connection\n")
+		// This is a change, we now expect them to be set for connections when the
+		// client sends a connect.
+		if ci.RTT == "" {
+			t.Fatal("Expected RTT to be set for new connection\n")
 		}
 	}
 
@@ -3325,14 +3331,26 @@ func TestMonitorLeafz(t *testing.T) {
 			if ln.RTT == "" {
 				t.Fatalf("RTT not tracked?")
 			}
-			if ln.NumSubs != 2 {
-				t.Fatalf("Expected 2 subs, got %v", ln.NumSubs)
+			if ln.NumSubs != 3 {
+				t.Fatalf("Expected 3 subs, got %v", ln.NumSubs)
 			}
-			if len(ln.Subs) != 2 {
+			if len(ln.Subs) != 3 {
 				t.Fatalf("Expected subs to be returned, got %v", len(ln.Subs))
 			}
-			if (ln.Subs[0] != "foo" || ln.Subs[1] != "bar") && (ln.Subs[0] != "bar" || ln.Subs[1] != "foo") {
-				t.Fatalf("Unexpected subjects: %v", ln.Subs)
+			var foundFoo bool
+			var foundBar bool
+			for _, sub := range ln.Subs {
+				if sub == "foo" {
+					foundFoo = true
+				} else if sub == "bar" {
+					foundBar = true
+				}
+			}
+			if !foundFoo {
+				t.Fatal("Did not find subject foo")
+			}
+			if !foundBar {
+				t.Fatal("Did not find subject bar")
 			}
 		}
 	}
@@ -3341,8 +3359,8 @@ func TestMonitorLeafz(t *testing.T) {
 	for pollMode := 1; pollMode < 2; pollMode++ {
 		l := pollLeafz(t, sa, pollMode, pollURL, nil)
 		for _, ln := range l.Leafs {
-			if ln.NumSubs != 2 {
-				t.Fatalf("Number of subs should be 2, got %v", ln.NumSubs)
+			if ln.NumSubs != 3 {
+				t.Fatalf("Number of subs should be 3, got %v", ln.NumSubs)
 			}
 			if len(ln.Subs) != 0 {
 				t.Fatalf("Subs should not have been returned, got %v", ln.Subs)

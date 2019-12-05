@@ -29,8 +29,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/server/gnatsd/server"
+	"github.com/kubemq-io/broker/client/nats"
 )
 
 // IMPORTANT: Tests in this file are not executed when running with the -race flag.
@@ -47,10 +47,16 @@ func TestNoRaceRouteSendSubs(t *testing.T) {
 	cfa := createConfFile(t, []byte(fmt.Sprintf(template, "")))
 	defer os.Remove(cfa)
 	srvA, optsA := RunServerWithConfig(cfa)
+	srvA.Shutdown()
+	optsA.DisableShortFirstPing = true
+	srvA = RunServer(optsA)
 	defer srvA.Shutdown()
 
 	cfb := createConfFile(t, []byte(fmt.Sprintf(template, "")))
 	srvB, optsB := RunServerWithConfig(cfb)
+	srvB.Shutdown()
+	optsB.DisableShortFirstPing = true
+	srvB = RunServer(optsB)
 	defer srvB.Shutdown()
 
 	clientA := createClientConn(t, optsA.Host, optsA.Port)
@@ -178,12 +184,12 @@ func TestNoRaceRouteSendSubs(t *testing.T) {
 	replyMsg := fmt.Sprintf("PUB ping.replies %d\r\n%s\r\n", len(payload), payload)
 	for _, s := range senders {
 		go func(s *sender, count int) {
+			defer wg.Done()
 			for i := 0; i < count; i++ {
 				s.sf(replyMsg)
 			}
 			s.sf("PING\r\n")
 			s.ef(pongRe)
-			wg.Done()
 		}(s, totalReplies/len(senders))
 	}
 

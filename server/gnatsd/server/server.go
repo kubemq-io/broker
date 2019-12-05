@@ -47,6 +47,9 @@ const (
 
 	// Interval for the first PING for non client connections.
 	firstPingInterval = time.Second
+
+	// This is for the first ping for client connections.
+	firstClientPingInterval = 2 * time.Second
 )
 
 // Make this a variable so that we can change during tests
@@ -56,6 +59,7 @@ var lameDuckModeInitialDelay = int64(lameDuckModeDefaultInitialDelay)
 // to help them understand information about this server.
 type Info struct {
 	ID                string   `json:"server_id"`
+	Name              string   `json:"server_name"`
 	Version           string   `json:"version"`
 	Proto             int      `json:"proto"`
 	GitCommit         string   `json:"git_commit,omitempty"`
@@ -82,6 +86,7 @@ type Info struct {
 	GatewayURL        string   `json:"gateway_url,omitempty"`         // Gateway URL on that server (sent by route's INFO)
 	GatewayCmd        byte     `json:"gateway_cmd,omitempty"`         // Command code for the receiving server to know what to do
 	GatewayCmdPayload []byte   `json:"gateway_cmd_payload,omitempty"` // Command payload when needed
+	GatewayNRP        bool     `json:"gateway_nrp,omitempty"`         // Uses new $GNR. prefix for mapped replies
 
 	// LeafNode Specific
 	LeafNodeURLs []string `json:"leafnode_urls,omitempty"` // LeafNode URLs that the server can reconnect to.
@@ -109,6 +114,8 @@ type Server struct {
 	accResolver      AccountResolver
 	clients          map[uint64]*client
 	routes           map[uint64]*client
+	routesByHash     sync.Map
+	hash             []byte
 	remotes          map[string]*client
 	leafs            map[uint64]*client
 	users            map[string]*User
@@ -181,6 +188,18 @@ type Server struct {
 	// added/removed routes. The monitoring code then check that
 	// to know if it should update the cluster's URLs array.
 	varzUpdateRouteURLs bool
+
+	// Keeps a sublist of of subscriptions attached to leafnode connections
+	// for the $GNR.*.*.*.> subject so that a server can send back a mapped
+	// gateway reply.
+	gwLeafSubs *Sublist
+
+	// Used for expiration of mapped GW replies
+	gwrm struct {
+		w  int32
+		ch chan time.Duration
+		m  sync.Map
+	}
 }
 
 // Make sure all are 64bits for atomic use
@@ -212,6 +231,11 @@ func NewServer(opts *Options) (*Server, error) {
 	kp, _ := nkeys.CreateServer()
 	pub, _ := kp.PublicKey()
 
+	serverName := pub
+	if opts.ServerName != "" {
+		serverName = opts.ServerName
+	}
+
 	// Validate some options. This is here because we cannot assume that
 	// server will always be started with configuration parsing (that could
 	// report issues). Its options can be (incorrectly) set by hand when
@@ -226,6 +250,7 @@ func NewServer(opts *Options) (*Server, error) {
 		Proto:        PROTO,
 		GitCommit:    gitCommit,
 		GoVersion:    runtime.Version(),
+		Name:         serverName,
 		Host:         opts.Host,
 		Port:         opts.Port,
 		AuthRequired: false,
@@ -244,6 +269,7 @@ func NewServer(opts *Options) (*Server, error) {
 		done:       make(chan bool, 1),
 		start:      now,
 		configTime: now,
+		gwLeafSubs: NewSublistWithCache(),
 	}
 
 	// Trusted root operator keys.
@@ -263,12 +289,10 @@ func NewServer(opts *Options) (*Server, error) {
 	// Call this even if there is no gateway defined. It will
 	// initialize the structure so we don't have to check for
 	// it to be nil or not in various places in the code.
-	gws, err := newGateway(opts)
-	if err != nil {
+	if err := s.newGateway(opts); err != nil {
 		return nil, err
 	}
-	s.gateway = gws
-	fmt.Println(s.gateway.enabled)
+
 	if s.gateway.enabled {
 		s.info.Cluster = s.getGatewayName()
 	}
@@ -305,9 +329,29 @@ func NewServer(opts *Options) (*Server, error) {
 		return nil, err
 	}
 
-	// In local config mode, if remote leafs are configured,
-	// make sure that if they reference local accounts, they exist.
-	if len(opts.TrustedOperators) == 0 && len(opts.LeafNode.Remotes) > 0 {
+	// In local config mode, check that leafnode configuration
+	// refers to account that exist.
+	if len(opts.TrustedOperators) == 0 {
+		checkAccountExists := func(accName string) error {
+			if accName == _EMPTY_ {
+				return nil
+			}
+			if _, ok := s.accounts.Load(accName); !ok {
+				return fmt.Errorf("cannot find account %q specified in leafnode authorization", accName)
+			}
+			return nil
+		}
+		if err := checkAccountExists(opts.LeafNode.Account); err != nil {
+			return nil, err
+		}
+		for _, lu := range opts.LeafNode.Users {
+			if lu.Account == nil {
+				continue
+			}
+			if err := checkAccountExists(lu.Account.Name); err != nil {
+				return nil, err
+			}
+		}
 		for _, r := range opts.LeafNode.Remotes {
 			if r.LocalAccount == _EMPTY_ {
 				continue
@@ -655,30 +699,40 @@ func (s *Server) numAccounts() int {
 	return count
 }
 
+// NumLoadedAccounts returns the number of loaded accounts.
+func (s *Server) NumLoadedAccounts() int {
+	return s.numAccounts()
+}
+
 // LookupOrRegisterAccount will return the given account if known or create a new entry.
 func (s *Server) LookupOrRegisterAccount(name string) (account *Account, isNew bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if v, ok := s.accounts.Load(name); ok {
 		return v.(*Account), false
 	}
 	acc := NewAccount(name)
-	s.registerAccount(acc)
+	s.registerAccountNoLock(acc)
 	return acc, true
 }
 
 // RegisterAccount will register an account. The account must be new
 // or this call will fail.
 func (s *Server) RegisterAccount(name string) (*Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.accounts.Load(name); ok {
 		return nil, ErrAccountExists
 	}
 	acc := NewAccount(name)
-	s.registerAccount(acc)
+	s.registerAccountNoLock(acc)
 	return acc, nil
 }
 
 // SetSystemAccount will set the internal system account.
 // If root operators are present it will also check validity.
 func (s *Server) SetSystemAccount(accName string) error {
+	// Lookup from sync.Map first.
 	if v, ok := s.accounts.Load(accName); ok {
 		return s.setSystemAccount(v.(*Account))
 	}
@@ -691,8 +745,11 @@ func (s *Server) SetSystemAccount(accName string) error {
 	}
 	acc := s.buildInternalAccount(ac)
 	acc.claimJWT = jwt
-	s.registerAccount(acc)
-
+	// Due to race, we need to make sure that we are not
+	// registering twice.
+	if racc := s.registerAccount(acc); racc != nil {
+		return nil
+	}
 	return s.setSystemAccount(acc)
 }
 
@@ -707,7 +764,7 @@ func (s *Server) SystemAccount() *Account {
 }
 
 // For internal sends.
-const internalSendQLen = 1024
+const internalSendQLen = 4096
 
 // Assign a system account. Should only be called once.
 // This sets up a server to send and receive messages from
@@ -741,9 +798,10 @@ func (s *Server) setSystemAccount(acc *Account) error {
 	}
 	acc.mu.Unlock()
 
+	now := time.Now()
 	s.sys = &internal{
 		account: acc,
-		client:  &client{srv: s, kind: SYSTEM, opts: internalOpts, msubs: -1, mpay: -1, start: time.Now(), last: time.Now()},
+		client:  &client{srv: s, kind: SYSTEM, opts: internalOpts, msubs: -1, mpay: -1, start: now, last: now},
 		seq:     1,
 		sid:     1,
 		servers: make(map[string]*serverUpdate),
@@ -797,16 +855,17 @@ func (s *Server) shouldTrackSubscriptions() bool {
 
 // Invokes registerAccountNoLock under the protection of the server lock.
 // That is, server lock is acquired/released in this function.
-func (s *Server) registerAccount(acc *Account) {
+// See registerAccountNoLock for comment on returned value.
+func (s *Server) registerAccount(acc *Account) *Account {
 	s.mu.Lock()
-	s.registerAccountNoLock(acc)
+	racc := s.registerAccountNoLock(acc)
 	s.mu.Unlock()
+	return racc
 }
 
-// Place common account setup here.
-// Lock should be held on entry.
-func (s *Server) registerAccountNoLock(acc *Account) {
-	if acc.sl == nil {
+// Helper to set the sublist based on preferences.
+func (s *Server) setAccountSublist(acc *Account) {
+	if acc != nil && acc.sl == nil {
 		opts := s.getOpts()
 		if opts != nil && opts.NoSublistCache {
 			acc.sl = NewSublistNoCache()
@@ -814,6 +873,22 @@ func (s *Server) registerAccountNoLock(acc *Account) {
 			acc.sl = NewSublistWithCache()
 		}
 	}
+}
+
+// Registers an account in the server.
+// Due to some locking considerations, we may end-up trying
+// to register the same account twice. This function will
+// then return the already registered account.
+// Lock should be held on entry.
+func (s *Server) registerAccountNoLock(acc *Account) *Account {
+	// We are under the server lock. Lookup from map, if present
+	// return existing account.
+	if a, _ := s.accounts.Load(acc.Name); a != nil {
+		s.tmpAccounts.Delete(acc.Name)
+		return a.(*Account)
+	}
+	// Finish account setup and store.
+	s.setAccountSublist(acc)
 	if acc.maxnae == 0 {
 		acc.maxnae = DEFAULT_MAX_ACCOUNT_AE_RESPONSE_MAPS
 	}
@@ -842,6 +917,7 @@ func (s *Server) registerAccountNoLock(acc *Account) {
 	s.accounts.Store(acc.Name, acc)
 	s.tmpAccounts.Delete(acc.Name)
 	s.enableAccountTracking(acc)
+	return nil
 }
 
 // lookupAccount is a function to return the account structure
@@ -970,23 +1046,21 @@ func (s *Server) verifyAccountClaims(claimJWT string) (*jwt.AccountClaims, strin
 func (s *Server) fetchAccount(name string) (*Account, error) {
 	accClaims, claimJWT, err := s.fetchAccountClaims(name)
 	if accClaims != nil {
-		// We have released the lock during the low level fetch.
-		// Now that we are back under lock, check again if account
-		// is in the map or not. If it is, simply return it.
-		if v, ok := s.accounts.Load(name); ok {
-			acc := v.(*Account)
+		acc := s.buildInternalAccount(accClaims)
+		acc.claimJWT = claimJWT
+		// Due to possible race, if registerAccount() returns a non
+		// nil account, it means the same account was already
+		// registered and we should use this one.
+		if racc := s.registerAccount(acc); racc != nil {
 			// Update with the new claims in case they are new.
 			// Following call will return ErrAccountResolverSameClaims
 			// if claims are the same.
-			err = s.updateAccountWithClaimJWT(acc, claimJWT)
+			err = s.updateAccountWithClaimJWT(racc, claimJWT)
 			if err != nil && err != ErrAccountResolverSameClaims {
 				return nil, err
 			}
-			return acc, nil
+			return racc, nil
 		}
-		acc := s.buildInternalAccount(accClaims)
-		acc.claimJWT = claimJWT
-		s.registerAccount(acc)
 		return acc, nil
 	}
 	return nil, err
@@ -1059,6 +1133,10 @@ func (s *Server) Start() {
 		}
 	}
 
+	// Start expiration of mapped GW replies, regardless if
+	// this server is configured with gateway or not.
+	s.startGWReplyMapExpiration()
+
 	// Start up gateway if needed. Do this before starting the routes, because
 	// we want to resolve the gateway host:port so that this information can
 	// be sent to other routes.
@@ -1120,7 +1198,7 @@ func (s *Server) Shutdown() {
 		s.mu.Unlock()
 		return
 	}
-	s.Noticef("Server Exiting..")
+	s.Noticef("Initiating Shutdown...")
 
 	opts := s.getOpts()
 
@@ -1223,6 +1301,7 @@ func (s *Server) Shutdown() {
 		s.deletePortsFile(opts.PortsFileDir)
 	}
 
+	s.Noticef("Server Exiting..")
 	// Close logger if applicable. It allows tests on Windows
 	// to be able to do proper cleanup (delete log file).
 	s.logging.RLock()
@@ -1672,7 +1751,7 @@ func (s *Server) createClient(conn net.Conn) *client {
 	// Do final client initialization
 
 	// Set the First Ping timer.
-	c.setFirstPingTimer(opts.PingInterval)
+	s.setFirstPingTimer(c)
 
 	// Spin up the read loop.
 	s.startGoRoutine(func() { c.readLoop() })
@@ -1714,6 +1793,10 @@ func (s *Server) saveClosedClient(c *client, nc net.Conn, reason ClosedState) {
 	}
 	// Hold user as well.
 	cc.user = c.opts.Username
+	// Hold account name if not the global account.
+	if c.acc != nil && c.acc.Name != globalAccountName {
+		cc.acc = c.acc.Name
+	}
 	c.mu.Unlock()
 
 	// Place in the ring buffer
@@ -2493,11 +2576,22 @@ func (s *Server) shouldReportConnectErr(firstConnect bool, attempts int) bool {
 // Invoked for route, leaf and gateway connections. Set the very first
 // PING to a lower interval to capture the initial RTT.
 // After that the PING interval will be set to the user defined value.
+// Client lock should be held.
 func (s *Server) setFirstPingTimer(c *client) {
 	opts := s.getOpts()
 	d := opts.PingInterval
-	if d > firstPingInterval {
-		d = firstPingInterval
+
+	if !opts.DisableShortFirstPing {
+		if c.kind != CLIENT {
+			if d > firstPingInterval {
+				d = firstPingInterval
+			}
+		} else if d > firstClientPingInterval {
+			d = firstClientPingInterval
+		}
 	}
+	// We randomize the first one by an offset up to 20%, e.g. 2m ~= max 24s.
+	addDelay := rand.Int63n(int64(d / 5))
+	d += time.Duration(addDelay)
 	c.ping.tmr = time.AfterFunc(d, c.processPingTimer)
 }

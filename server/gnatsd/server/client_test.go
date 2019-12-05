@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/kubemq-io/broker/client/nats"
+	"io"
 	"math"
 	"net"
 	"reflect"
@@ -482,6 +484,189 @@ func TestClientPubWithQueueSub(t *testing.T) {
 	// Threshold for randomness for now
 	if n1 < 20 || n2 < 20 {
 		t.Fatalf("Received wrong # of msgs per subscriber: %d - %d\n", n1, n2)
+	}
+}
+
+func TestSplitSubjectQueue(t *testing.T) {
+	cases := []struct {
+		name        string
+		sq          string
+		wantSubject []byte
+		wantQueue   []byte
+		wantErr     bool
+	}{
+		{name: "single subject",
+			sq: "foo", wantSubject: []byte("foo"), wantQueue: nil},
+		{name: "subject and queue",
+			sq: "foo bar", wantSubject: []byte("foo"), wantQueue: []byte("bar")},
+		{name: "subject and queue with surrounding spaces",
+			sq: " foo bar ", wantSubject: []byte("foo"), wantQueue: []byte("bar")},
+		{name: "subject and queue with extra spaces in the middle",
+			sq: "foo  bar", wantSubject: []byte("foo"), wantQueue: []byte("bar")},
+		{name: "subject, queue, and extra token",
+			sq: "foo  bar fizz", wantSubject: []byte(nil), wantQueue: []byte(nil), wantErr: true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sub, que, err := splitSubjectQueue(c.sq)
+			if err == nil && c.wantErr {
+				t.Fatal("Expected error, but got nil")
+			}
+			if err != nil && !c.wantErr {
+				t.Fatalf("Expected nil error, but got %v", err)
+			}
+
+			if !reflect.DeepEqual(sub, c.wantSubject) {
+				t.Fatalf("Expected to get subject %#v, but instead got %#v", c.wantSubject, sub)
+			}
+			if !reflect.DeepEqual(que, c.wantQueue) {
+				t.Fatalf("Expected to get queue %#v, but instead got %#v", c.wantQueue, que)
+			}
+		})
+	}
+}
+
+func TestQueueSubscribePermissions(t *testing.T) {
+	cases := []struct {
+		name    string
+		perms   *SubjectPermission
+		subject string
+		queue   string
+		want    string
+	}{
+		{
+			name:    "plain subscription on foo",
+			perms:   &SubjectPermission{Allow: []string{"foo"}},
+			subject: "foo",
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "queue subscribe with allowed group",
+			perms:   &SubjectPermission{Allow: []string{"foo bar"}},
+			subject: "foo",
+			queue:   "bar",
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "queue subscribe with wildcard allowed group",
+			perms:   &SubjectPermission{Allow: []string{"foo bar.*"}},
+			subject: "foo",
+			queue:   "bar.fizz",
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "queue subscribe with full wildcard subject and subgroup",
+			perms:   &SubjectPermission{Allow: []string{"> bar.>"}},
+			subject: "whizz",
+			queue:   "bar.bang",
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "plain subscribe with full wildcard subject and subgroup",
+			perms:   &SubjectPermission{Allow: []string{"> bar.>"}},
+			subject: "whizz",
+			want:    "-ERR 'Permissions Violation for Subscription to \"whizz\"'\r\n",
+		},
+		{
+			name:    "deny plain subscription on foo",
+			perms:   &SubjectPermission{Allow: []string{">"}, Deny: []string{"foo"}},
+			subject: "foo",
+			queue:   "bar",
+			want:    "-ERR 'Permissions Violation for Subscription to \"foo\" using queue \"bar\"'\r\n",
+		},
+		{
+			name:    "allow plain subscription, except foo",
+			perms:   &SubjectPermission{Allow: []string{">"}, Deny: []string{"foo"}},
+			subject: "bar",
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "deny everything",
+			perms:   &SubjectPermission{Allow: []string{">"}, Deny: []string{">"}},
+			subject: "foo",
+			queue:   "bar",
+			want:    "-ERR 'Permissions Violation for Subscription to \"foo\" using queue \"bar\"'\r\n",
+		},
+		{
+			name:    "can only subscribe to queues v1",
+			perms:   &SubjectPermission{Allow: []string{"> v1.>"}},
+			subject: "foo",
+			queue:   "v1.prod",
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "cannot subscribe to queues, plain subscribe ok",
+			perms:   &SubjectPermission{Allow: []string{">"}, Deny: []string{"> >"}},
+			subject: "foo",
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "cannot subscribe to queues, queue subscribe not ok",
+			perms:   &SubjectPermission{Deny: []string{"> >"}},
+			subject: "foo",
+			queue:   "bar",
+			want:    "-ERR 'Permissions Violation for Subscription to \"foo\" using queue \"bar\"'\r\n",
+		},
+		{
+			name:    "deny all queue subscriptions on dev or stg only",
+			perms:   &SubjectPermission{Deny: []string{"> *.dev", "> *.stg"}},
+			subject: "foo",
+			queue:   "bar",
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "allow only queue subscription on dev or stg",
+			perms:   &SubjectPermission{Allow: []string{"> *.dev", "> *.stg"}},
+			subject: "foo",
+			queue:   "bar",
+			want:    "-ERR 'Permissions Violation for Subscription to \"foo\" using queue \"bar\"'\r\n",
+		},
+		{
+			name:    "deny queue subscriptions with subject foo",
+			perms:   &SubjectPermission{Deny: []string{"foo >"}},
+			subject: "foo",
+			queue:   "bar",
+			want:    "-ERR 'Permissions Violation for Subscription to \"foo\" using queue \"bar\"'\r\n",
+		},
+		{
+			name:    "plain sub is allowed, but queue subscribe with queue not in list",
+			perms:   &SubjectPermission{Allow: []string{"foo bar"}},
+			subject: "foo",
+			queue:   "fizz",
+			want:    "-ERR 'Permissions Violation for Subscription to \"foo\" using queue \"fizz\"'\r\n",
+		},
+		{
+			name:    "allow plain sub, but do queue subscribe",
+			perms:   &SubjectPermission{Allow: []string{"foo"}},
+			subject: "foo",
+			queue:   "bar",
+			want:    "+OK\r\n",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, client, r := setupClient()
+
+			client.RegisterUser(&User{
+				Permissions: &Permissions{Subscribe: c.perms},
+			})
+			connect := []byte("CONNECT {\"verbose\":true}\r\n")
+			qsub := []byte(fmt.Sprintf("SUB %s %s 1\r\n", c.subject, c.queue))
+
+			go client.parseFlushAndClose(append(connect, qsub...))
+
+			var buf bytes.Buffer
+			if _, err := io.Copy(&buf, r); err != nil {
+				t.Fatal(err)
+			}
+
+			// Extra OK is from the successful CONNECT.
+			want := "+OK\r\n" + c.want
+			if got := buf.String(); got != want {
+				t.Fatalf("Expected to receive %q, but instead received %q", want, got)
+			}
+		})
 	}
 }
 
@@ -1446,5 +1631,111 @@ func TestResponsePermissions(t *testing.T) {
 				time.Sleep(400 * time.Millisecond)
 			}
 		})
+	}
+}
+
+func TestPingNotSentTooSoon(t *testing.T) {
+	opts := DefaultOptions()
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	doneCh := make(chan bool, 1)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			s.Connz(nil)
+			select {
+			case <-doneCh:
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}()
+
+	for i := 0; i < 100; i++ {
+		nc, err := nats.Connect(s.ClientURL())
+		if err != nil {
+			t.Fatalf("Error on connect: %v", err)
+		}
+		nc.Close()
+	}
+	close(doneCh)
+	wg.Wait()
+
+	c, br, _ := newClientForServer(s)
+	connectOp := []byte("CONNECT {\"user\":\"ivan\",\"pass\":\"bar\"}\r\n")
+	c.parse(connectOp)
+
+	// Since client has not send PING, having server try to send RTT ping
+	// to client should not do anything
+	if c.sendRTTPing() {
+		t.Fatalf("RTT ping should not have been sent")
+	}
+	// Speed up detection of time elapsed by moving the c.start to more than
+	// 2 secs in the past.
+	c.mu.Lock()
+	c.start = time.Unix(0, c.start.UnixNano()-int64(maxNoRTTPingBeforeFirstPong+time.Second))
+	c.mu.Unlock()
+
+	errCh := make(chan error, 1)
+	go func() {
+		l, _ := br.ReadString('\n')
+		if l != "PING\r\n" {
+			errCh <- fmt.Errorf("expected to get PING, got %s", l)
+			return
+		}
+		errCh <- nil
+	}()
+	if !c.sendRTTPing() {
+		t.Fatalf("RTT ping should have been sent")
+	}
+	wg.Wait()
+	if e := <-errCh; e != nil {
+		t.Fatal(e.Error())
+	}
+}
+
+func TestClientCheckUseOfGWReplyPrefix(t *testing.T) {
+	opts := DefaultOptions()
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	ech := make(chan error, 1)
+	nc, err := nats.Connect(s.ClientURL(),
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, e error) {
+			ech <- e
+		}))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	// Expect to fail if publish on gateway reply prefix
+	nc.Publish(gwReplyPrefix+"anything", []byte("should fail"))
+
+	// Wait for publish violation error
+	select {
+	case e := <-ech:
+		if e == nil || !strings.Contains(strings.ToLower(e.Error()), "violation for publish") {
+			t.Fatalf("Expected violation error, got %v", e)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Did not receive permissions violation error")
+	}
+
+	// Now publish a message with a reply set to the prefix,
+	// it should be rejected too.
+	nc.PublishRequest("foo", gwReplyPrefix+"anything", []byte("should fail"))
+
+	// Wait for publish violation error with reply
+	select {
+	case e := <-ech:
+		if e == nil || !strings.Contains(strings.ToLower(e.Error()), "violation for publish with reply") {
+			t.Fatalf("Expected violation error, got %v", e)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Did not receive permissions violation error")
 	}
 }

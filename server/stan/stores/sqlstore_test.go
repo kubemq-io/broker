@@ -29,9 +29,9 @@ import (
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/test"
 
-	mysql "github.com/go-sql-driver/mysql"                         // mysql driver
+	mysql "github.com/go-sql-driver/mysql"                                    // mysql driver
 	_ "github.com/kubemq-io/broker/server/stan/stores/pqdeadlines" // wrapper for postgres that gives read/write deadlines
-	_ "github.com/lib/pq"                                          // postgres driver
+	_ "github.com/lib/pq"                                                     // postgres driver
 )
 
 // The SourceAdmin is used by the test setup to have access

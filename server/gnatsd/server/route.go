@@ -59,10 +59,13 @@ var (
 )
 
 // Used by tests
-var testRouteProto = RouteProtoV2
+func setRouteProtoForTest(wantedProto int) int {
+	return (wantedProto + 1) * -1
+}
 
 type route struct {
 	remoteID     string
+	remoteName   string
 	didSolicit   bool
 	retry        bool
 	routeType    RouteType
@@ -73,6 +76,7 @@ type route struct {
 	replySubs    map[*subscription]*time.Timer
 	gatewayURL   string
 	leafnodeURL  string
+	hash         string
 }
 
 type connectInfo struct {
@@ -103,24 +107,6 @@ const (
 
 // Can be changed for tests
 var routeConnectDelay = DEFAULT_ROUTE_CONNECT
-
-// This will add a timer to watch over remote reply subjects in case
-// they fail to receive a response. The duration will be taken from the
-// accounts map timeout to match.
-// Lock should be held upon entering.
-func (c *client) addReplySubTimeout(acc *Account, sub *subscription, d time.Duration) {
-	if c.route.replySubs == nil {
-		c.route.replySubs = make(map[*subscription]*time.Timer)
-	}
-	rs := c.route.replySubs
-	rs[sub] = time.AfterFunc(d, func() {
-		c.mu.Lock()
-		delete(rs, sub)
-		sub.max = 0
-		c.mu.Unlock()
-		c.unsubscribe(acc, sub, true, true)
-	})
-}
 
 // removeReplySub is called when we trip the max on remoteReply subs.
 func (c *client) removeReplySub(sub *subscription) {
@@ -265,6 +251,12 @@ func (c *client) processInboundRoutedMsg(msg []byte) {
 		return
 	}
 
+	// If the subject (c.pa.subject) has the gateway prefix, this function will handle it.
+	if c.handleGatewayReply(msg) {
+		// We are done here.
+		return
+	}
+
 	acc, r := c.getAccAndResultFromCache()
 	if acc == nil {
 		c.Debugf("Unknown account %q for routed message on subject: %q", c.pa.account, c.pa.subject)
@@ -278,45 +270,9 @@ func (c *client) processInboundRoutedMsg(msg []byte) {
 
 	// Check for no interest, short circuit if so.
 	// This is the fanout scale.
-	if len(r.psubs)+len(r.qsubs) == 0 {
-		return
+	if len(r.psubs)+len(r.qsubs) > 0 {
+		c.processMsgResults(acc, r, msg, c.pa.subject, c.pa.reply, pmrNoFlag)
 	}
-
-	// Check to see if we have a routed message with a service reply.
-	if isServiceReply(c.pa.reply) && acc != nil {
-		// Need to add a sub here for local interest to send a response back
-		// to the originating server/requestor where it will be re-mapped.
-		sid := make([]byte, 0, len(acc.Name)+len(c.pa.reply)+1)
-		sid = append(sid, acc.Name...)
-		sid = append(sid, ' ')
-		sid = append(sid, c.pa.reply...)
-		// Copy off the reply since otherwise we are referencing a buffer that will be reused.
-		reply := make([]byte, len(c.pa.reply))
-		copy(reply, c.pa.reply)
-		sub := &subscription{client: c, subject: reply, sid: sid, max: 1}
-		if err := acc.sl.Insert(sub); err != nil {
-			c.Errorf("Could not insert subscription: %v", err)
-		} else {
-			ttl := acc.AutoExpireTTL()
-			c.mu.Lock()
-			c.subs[string(sid)] = sub
-			c.addReplySubTimeout(acc, sub, ttl)
-			c.mu.Unlock()
-		}
-	}
-	c.processMsgResults(acc, r, msg, c.pa.subject, c.pa.reply, pmrNoFlag)
-}
-
-// Helper function for routes and gateways and leafnodes to create qfilters
-// needed for converted subs from imports, etc.
-func (c *client) makeQFilter(qsubs [][]*subscription) {
-	qs := make([][]byte, 0, len(qsubs))
-	for _, qsub := range qsubs {
-		if len(qsub) > 0 {
-			qs = append(qs, qsub[0].queue)
-		}
-	}
-	c.pa.queues = qs
 }
 
 // Lock should be held entering here.
@@ -411,10 +367,13 @@ func (c *client) processRouteInfo(info *Info) {
 	c.route.authRequired = info.AuthRequired
 	c.route.tlsRequired = info.TLSRequired
 	c.route.gatewayURL = info.GatewayURL
+	c.route.remoteName = info.Name
 	// When sent through route INFO, if the field is set, it should be of size 1.
 	if len(info.LeafNodeURLs) == 1 {
 		c.route.leafnodeURL = info.LeafNodeURLs[0]
 	}
+	// Compute the hash of this route based on remoteID
+	c.route.hash = string(getHash(info.ID))
 
 	// If this is an update due to config reload on the remote server,
 	// need to possibly send local subs to the remote server.
@@ -1242,7 +1201,11 @@ func (s *Server) addRoute(c *client, info *Info) (bool, bool) {
 		c.mu.Lock()
 		c.route.connectURLs = info.ClientConnectURLs
 		cid := c.cid
+		hash := string(c.route.hash)
 		c.mu.Unlock()
+
+		// Store this route using the hash as the key
+		s.routesByHash.Store(hash, c)
 
 		// Now that we have registered the route, we can remove from the temp map.
 		s.removeFromTempClients(cid)
@@ -1279,6 +1242,8 @@ func (s *Server) addRoute(c *client, info *Info) (bool, bool) {
 		// would cause the leafnode URL for that remote server to be removed
 		// from our list.
 		c.route.leafnodeURL = _EMPTY_
+		// Same for the route hash otherwise it would be removed from s.routesByHash.
+		c.route.hash = _EMPTY_
 		c.mu.Unlock()
 
 		remote.mu.Lock()
@@ -1465,13 +1430,22 @@ func (s *Server) routeAcceptLoop(ch chan struct{}) {
 		net.JoinHostPort(opts.Cluster.Host, strconv.Itoa(l.Addr().(*net.TCPAddr).Port)))
 
 	s.mu.Lock()
+	proto := RouteProtoV2
 	// For tests, we want to be able to make this server behave
-	// as an older server so we use the variable which we can override.
-	proto := testRouteProto
+	// as an older server so check this option to see if we should override
+	if opts.routeProto < 0 {
+		// We have a private option that allows test to override the route
+		// protocol. We want this option initial value to be 0, however,
+		// since original proto is RouteProtoZero, tests call setRouteProtoForTest(),
+		// which sets as negative value the (desired proto + 1) * -1.
+		// Here we compute back the real value.
+		proto = (opts.routeProto * -1) - 1
+	}
 	// Check for TLSConfig
 	tlsReq := opts.Cluster.TLSConfig != nil
 	info := Info{
 		ID:           s.info.ID,
+		Name:         s.info.Name,
 		Version:      s.info.Version,
 		GoVersion:    runtime.Version(),
 		AuthRequired: false,
@@ -1713,12 +1687,14 @@ func (c *client) processRouteConnect(srv *Server, arg []byte, lang string) error
 func (s *Server) removeRoute(c *client) {
 	var rID string
 	var lnURL string
+	var hash string
 	c.mu.Lock()
 	cid := c.cid
 	r := c.route
 	if r != nil {
 		rID = r.remoteID
 		lnURL = r.leafnodeURL
+		hash = r.hash
 	}
 	c.mu.Unlock()
 	s.mu.Lock()
@@ -1735,6 +1711,7 @@ func (s *Server) removeRoute(c *client) {
 		if lnURL != _EMPTY_ && s.removeLeafNodeURL(lnURL) {
 			s.sendAsyncLeafNodeInfo()
 		}
+		s.routesByHash.Delete(hash)
 	}
 	s.removeFromTempClients(cid)
 	s.mu.Unlock()

@@ -11,7 +11,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package stan is a Go client for the NATS Streaming messaging system (https://nats.io).
 package stan
 
 import (
@@ -19,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	nats "github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
@@ -40,6 +39,7 @@ type Msg struct {
 
 // Subscription represents a subscription within the NATS Streaming cluster. Subscriptions
 // will be rate matched and follow at-least once delivery semantics.
+// The subscription is safe to use in multiple Go routines concurrently.
 type Subscription interface {
 	// Unsubscribe removes interest in the subscription.
 	// For durables, it means that the durable interest is also removed from
@@ -56,7 +56,7 @@ type Subscription interface {
 	// These functions have been added for expert-users that need to get details
 	// about the low level NATS Subscription used internally to receive messages
 	// for this streaming subscription. They are documented in the Go client
-	// library: https://godoc.org/github.com/kubemq-io/nats.go#Subscription.ClearMaxPending
+	// library: https://godoc.org/github.com/kubemq-io/broker/client/nats#Subscription.ClearMaxPending
 
 	// ClearMaxPending resets the maximums seen so far.
 	ClearMaxPending() error
@@ -257,6 +257,7 @@ func (sc *conn) subscribe(subject, qgroup string, cb MsgHandler, options ...Subs
 	if err != nil {
 		return nil, err
 	}
+	nsub.SetPendingLimits(-1, -1)
 	sub.inboxSub = nsub
 
 	// Create a subscription request

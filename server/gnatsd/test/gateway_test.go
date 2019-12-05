@@ -20,8 +20,10 @@ import (
 	"net"
 	"regexp"
 	"testing"
+	"time"
 
 	"github.com/kubemq-io/broker/server/gnatsd/server"
+	"github.com/kubemq-io/broker/client/nats"
 )
 
 func testDefaultOptionsForGateway(name string) *server.Options {
@@ -515,4 +517,57 @@ func TestGatewayNoAccUnsubAfterQSub(t *testing.T) {
 	clientExpect(pongRe)
 
 	expectNothing(t, gA)
+}
+
+func TestGatewayErrorOnRSentFromOutbound(t *testing.T) {
+	ob := testDefaultOptionsForGateway("B")
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	for _, test := range []struct {
+		name  string
+		proto string
+	}{
+		{"RS+", "RS+"},
+		{"RS-", "RS-"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gA := createGatewayConn(t, ob.Gateway.Host, ob.Gateway.Port)
+			defer gA.Close()
+
+			gASend, gAExpect := setupGatewayConn(t, gA, "A", "B")
+			gASend("PING\r\n")
+			gAExpect(pongRe)
+
+			gASend(fmt.Sprintf("%s foo bar\r\n", test.proto))
+			expectDisconnect(t, gA)
+		})
+	}
+}
+
+func TestGatewaySystemConnectionAllowedToPublishOnGWPrefix(t *testing.T) {
+	sc := createSuperCluster(t, 2, 2)
+	defer sc.shutdown()
+
+	o := sc.clusters[1].opts[1]
+	url := fmt.Sprintf("nats://sys:pass@%s:%d", o.Host, o.Port)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	reply := nats.NewInbox()
+	sub, err := nc.SubscribeSync(reply)
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	if err := nc.PublishRequest("$SYS.REQ.SERVER.PING", reply, nil); err != nil {
+		t.Fatalf("Failed to send request: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		if _, err := sub.NextMsg(time.Second); err != nil {
+			t.Fatalf("Expected to get a response, got %v", err)
+		}
+	}
 }

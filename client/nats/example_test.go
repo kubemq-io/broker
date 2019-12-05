@@ -1,4 +1,4 @@
-// Copyright 2012-2018 The NATS Authors
+// Copyright 2012-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -26,10 +26,10 @@ func ExampleConnect() {
 	nc, _ := nats.Connect(nats.DefaultURL)
 	nc.Close()
 
-	nc, _ = nats.Connect("nats://derek:secretpassword@demo.server.io:4222")
+	nc, _ = nats.Connect("nats://derek:secretpassword@demo.nats.io:4222")
 	nc.Close()
 
-	nc, _ = nats.Connect("tls://derek:secretpassword@demo.server.io:4443")
+	nc, _ = nats.Connect("tls://derek:secretpassword@demo.nats.io:4443")
 	nc.Close()
 
 	opts := nats.Options{
@@ -231,7 +231,7 @@ func ExampleEncodedConn_Subscribe() {
 	c.Publish("hello", me)
 }
 
-// BindSendChan() allows binding of a Go channel to a server
+// BindSendChan() allows binding of a Go channel to a nats
 // subject for publish operations. The Encoder attached to the
 // EncodedConn will be used for marshaling.
 func ExampleEncodedConn_BindSendChan() {
@@ -252,7 +252,7 @@ func ExampleEncodedConn_BindSendChan() {
 	ch <- me
 }
 
-// BindRecvChan() allows binding of a Go channel to a server
+// BindRecvChan() allows binding of a Go channel to a nats
 // subject for subscribe operations. The Encoder attached to the
 // EncodedConn will be used for un-marshaling.
 func ExampleEncodedConn_BindRecvChan() {

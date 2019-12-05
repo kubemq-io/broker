@@ -28,10 +28,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/server/gnatsd/logger"
 	"github.com/kubemq-io/broker/server/gnatsd/server"
 	"github.com/nats-io/jwt"
+	"github.com/kubemq-io/broker/client/nats"
 	"github.com/nats-io/nkeys"
+	"github.com/kubemq-io/broker/nuid"
 )
 
 func createLeafConn(t tLogger, host string, port int) net.Conn {
@@ -94,6 +96,41 @@ func TestLeafNodeInfo(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func TestLeafNodeSplitBuffer(t *testing.T) {
+	s, opts := runLeafServer()
+	defer s.Shutdown()
+
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	nc.QueueSubscribe("foo", "bar", func(m *nats.Msg) {
+		m.Respond([]byte("ok"))
+	})
+	nc.Flush()
+
+	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+	sendProto(t, lc, "CONNECT {}\r\n")
+	checkLeafNodeConnected(t, s)
+
+	leafSend, leafExpect := setupLeaf(t, lc, 2)
+
+	leafSend("LS+ reply\r\nPING\r\n")
+	leafExpect(pongRe)
+
+	leafSend("LMSG foo ")
+	time.Sleep(time.Millisecond)
+	leafSend("+ reply bar 2\r\n")
+	time.Sleep(time.Millisecond)
+	leafSend("OK\r")
+	time.Sleep(time.Millisecond)
+	leafSend("\n")
+	leafExpect(lmsgRe)
 }
 
 func TestNumLeafNodes(t *testing.T) {
@@ -163,6 +200,15 @@ func TestLeafNodeRequiresConnect(t *testing.T) {
 	expectDisconnect(t, lc)
 }
 
+func setupLeaf(t *testing.T, lc net.Conn, expectedSubs int) (sendFun, expectFun) {
+	t.Helper()
+	send, expect := setupConn(t, lc)
+	// A loop detection subscription is sent, so consume this here, along
+	// with the ones that caller expect on setup.
+	expectNumberOfProtos(t, expect, lsubRe, expectedSubs)
+	return send, expect
+}
+
 func TestLeafNodeSendsSubsAfterConnect(t *testing.T) {
 	s, opts := runLeafServer()
 	defer s.Shutdown()
@@ -182,12 +228,9 @@ func TestLeafNodeSendsSubsAfterConnect(t *testing.T) {
 	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 
-	_, leafExpect := setupConn(t, lc)
-	matches := lsubRe.FindAllSubmatch(leafExpect(lsubRe), -1)
 	// This should compress down to 1 for foo, 1 for bar, and 1 for foo [baz]
-	if len(matches) != 3 {
-		t.Fatalf("Expected 3 results, got %d", len(matches))
-	}
+	// and one for the loop detection subject.
+	setupLeaf(t, lc, 4)
 }
 
 func TestLeafNodeSendsSubsOngoing(t *testing.T) {
@@ -204,7 +247,7 @@ func TestLeafNodeSendsSubsOngoing(t *testing.T) {
 	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 
-	leafSend, leafExpect := setupConn(t, lc)
+	leafSend, leafExpect := setupLeaf(t, lc, 1)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -246,7 +289,7 @@ func TestLeafNodeSubs(t *testing.T) {
 	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 
-	leafSend, leafExpect := setupConn(t, lc)
+	leafSend, leafExpect := setupLeaf(t, lc, 1)
 
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
@@ -328,7 +371,7 @@ func TestLeafNodeMsgDelivery(t *testing.T) {
 	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 
-	leafSend, leafExpect := setupConn(t, lc)
+	leafSend, leafExpect := setupLeaf(t, lc, 1)
 
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
@@ -398,7 +441,7 @@ func TestLeafNodeAndRoutes(t *testing.T) {
 	lc := createLeafConn(t, optsA.LeafNode.Host, optsA.LeafNode.Port)
 	defer lc.Close()
 
-	leafSend, leafExpect := setupConn(t, lc)
+	leafSend, leafExpect := setupLeaf(t, lc, 1)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -455,9 +498,14 @@ func TestLeafNodeAndRoutes(t *testing.T) {
 // Helper function to check that a leaf node has connected to our server.
 func checkLeafNodeConnected(t *testing.T, s *server.Server) {
 	t.Helper()
+	checkLeafNodeConnections(t, s, 1)
+}
+
+func checkLeafNodeConnections(t *testing.T, s *server.Server, expected int) {
+	t.Helper()
 	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
-		if nln := s.NumLeafNodes(); nln != 1 {
-			return fmt.Errorf("Expected a connected leafnode for server %q, got none", s.ID())
+		if nln := s.NumLeafNodes(); nln != expected {
+			return fmt.Errorf("Expected a connected leafnode for server %q, got %d", s.ID(), nln)
 		}
 		return nil
 	})
@@ -493,7 +541,7 @@ func TestLeafNodeNoEcho(t *testing.T) {
 	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 
-	leafSend, leafExpect := setupConn(t, lc)
+	leafSend, leafExpect := setupLeaf(t, lc, 1)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -539,6 +587,14 @@ func shutdownCluster(c *cluster) {
 	for _, s := range c.servers {
 		s.Shutdown()
 	}
+}
+
+func (c *cluster) totalSubs() int {
+	totalSubs := 0
+	for _, s := range c.servers {
+		totalSubs += int(s.NumSubscriptions())
+	}
+	return totalSubs
 }
 
 // Wait for the expected number of outbound gateways, or fails.
@@ -699,9 +755,8 @@ func TestLeafNodeGatewaySendsSystemEvent(t *testing.T) {
 	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 
-	leafSend, leafExpect := setupConn(t, lc)
 	// This is for our global responses since we are setting up GWs above.
-	leafExpect(lsubRe)
+	leafSend, leafExpect := setupLeaf(t, lc, 3)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -742,9 +797,17 @@ func TestLeafNodeGatewayInterestPropagation(t *testing.T) {
 	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 	_, leafExpect := setupConn(t, lc)
-	buf := leafExpect(lsubRe)
-	if !strings.Contains(string(buf), "foo") {
-		t.Fatalf("Expected interest for 'foo' as 'LS+ foo\\r\\n', got %q", buf)
+	var totalBuf []byte
+	for count := 0; count != 4; {
+		buf := leafExpect(lsubRe)
+		totalBuf = append(totalBuf, buf...)
+		count += len(lsubRe.FindAllSubmatch(buf, -1))
+		if count > 4 {
+			t.Fatalf("Expected %v matches, got %v (buf=%s)", 3, count, totalBuf)
+		}
+	}
+	if !strings.Contains(string(totalBuf), "foo") {
+		t.Fatalf("Expected interest for 'foo' as 'LS+ foo\\r\\n', got %q", totalBuf)
 	}
 }
 
@@ -784,9 +847,8 @@ func TestLeafNodeWithRouteAndGateway(t *testing.T) {
 	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 
-	leafSend, leafExpect := setupConn(t, lc)
 	// This is for our global responses since we are setting up GWs above.
-	leafExpect(lsubRe)
+	leafSend, leafExpect := setupLeaf(t, lc, 3)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -924,6 +986,7 @@ func TestLeafNodeBasicAuth(t *testing.T) {
 	lc = createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 	leafSend, leafExpect := setupConnWithUserPass(t, lc, "derek", "s3cr3t!")
+	leafExpect(lsubRe)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -2126,9 +2189,8 @@ func TestLeafNodeSwitchGatewayToInterestModeOnly(t *testing.T) {
 	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 
-	leafSend, leafExpect := setupConn(t, lc)
 	// This is for our global responses since we are setting up GWs above.
-	leafExpect(lsubRe)
+	leafSend, leafExpect := setupLeaf(t, lc, 3)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 }
@@ -2234,8 +2296,7 @@ func TestLeafNodeSendsRemoteSubsOnConnect(t *testing.T) {
 	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 
-	_, leafExpect := setupConn(t, lc)
-	leafExpect(lsubRe)
+	setupLeaf(t, lc, 2)
 }
 
 func TestLeafNodeServiceImportLikeNGS(t *testing.T) {
@@ -2590,17 +2651,35 @@ func TestLeafNodeAndGatewayGlobalRouting(t *testing.T) {
 	})
 	ncl.Flush()
 
-	// Create a direct connect requestor.
-	opts := cb.opts[1]
-	url := fmt.Sprintf("nats://ngs:pass@%s:%d", opts.Host, opts.Port)
-	nc, err := nats.Connect(url)
-	if err != nil {
-		t.Fatalf("Error on connect: %v", err)
-	}
-	defer nc.Close()
+	// Create a direct connect requestor. Try with all possible
+	// servers in cluster B to make sure that we also receive the
+	// reply when the accepting leafnode server does not have
+	// its outbound GW connection to the requestor's server.
+	for i := 0; i < 3; i++ {
+		opts := cb.opts[i]
+		url := fmt.Sprintf("nats://ngs:pass@%s:%d", opts.Host, opts.Port)
+		nc, err := nats.Connect(url)
+		if err != nil {
+			t.Fatalf("Error on connect: %v", err)
+		}
+		defer nc.Close()
 
-	if _, err := nc.Request("foo", []byte("Hello"), 250*time.Millisecond); err != nil {
-		t.Fatalf("Failed to get response: %v", err)
+		// We don't use an INBOX here because we had a bug where
+		// leafnode would subscribe to _GR_.*.*.*.> instead of
+		// _GR_.>, and inbox masked that because of their number
+		// of tokens.
+		reply := nuid.Next()
+		sub, err := nc.SubscribeSync(reply)
+		if err != nil {
+			t.Fatalf("Error on subscribe: %v", err)
+		}
+		if err := nc.PublishRequest("foo", reply, []byte("Hello")); err != nil {
+			t.Fatalf("Failed to get response: %v", err)
+		}
+		if _, err := sub.NextMsg(250 * time.Millisecond); err != nil {
+			t.Fatalf("Did not get reply: %v", err)
+		}
+		nc.Close()
 	}
 }
 
@@ -2876,4 +2955,57 @@ func TestLeafNodeNoRaceGeneratingNonce(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	close(quitCh)
 	wg.Wait()
+}
+
+func runSolicitAndAcceptLeafServer(lso *server.Options) (*server.Server, *server.Options) {
+	surl := fmt.Sprintf("nats-leaf://%s:%d", lso.LeafNode.Host, lso.LeafNode.Port)
+	o := testDefaultOptionsForLeafNodes()
+	o.Port = -1
+	rurl, _ := url.Parse(surl)
+	o.LeafNode.Remotes = []*server.RemoteLeafOpts{{URLs: []*url.URL{rurl}}}
+	o.LeafNode.ReconnectInterval = 100 * time.Millisecond
+	return RunServer(o), o
+}
+
+func TestLeafNodeDaisyChain(t *testing.T) {
+	// To quickly enable trace and debug logging
+	// doLog, doTrace, doDebug = true, true, true
+	s1, opts1 := runLeafServer()
+	defer s1.Shutdown()
+
+	s2, opts2 := runSolicitAndAcceptLeafServer(opts1)
+	defer s2.Shutdown()
+	checkLeafNodeConnected(t, s1)
+
+	s3, _ := runSolicitLeafServer(opts2)
+	defer s3.Shutdown()
+	checkLeafNodeConnections(t, s2, 2)
+
+	// Make so we can tell the two apart since in same PID.
+	if doLog {
+		s1.SetLogger(logger.NewTestLogger("[S-1] - ", false), true, true)
+		s2.SetLogger(logger.NewTestLogger("[S-2] - ", false), true, true)
+		s3.SetLogger(logger.NewTestLogger("[S-3] - ", false), true, true)
+	}
+
+	nc1, err := nats.Connect(s1.ClientURL())
+	if err != nil {
+		t.Fatalf("Error creating client: %v", err)
+	}
+	defer nc1.Close()
+
+	nc1.Subscribe("ngs.usage", func(msg *nats.Msg) {
+		msg.Respond([]byte("22 msgs"))
+	})
+	nc1.Flush()
+
+	nc2, err := nats.Connect(s3.ClientURL())
+	if err != nil {
+		t.Fatalf("Error creating client: %v", err)
+	}
+	defer nc2.Close()
+
+	if _, err = nc2.Request("ngs.usage", []byte("1h"), time.Second); err != nil {
+		t.Fatalf("Expected a response")
+	}
 }

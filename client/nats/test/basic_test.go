@@ -50,6 +50,21 @@ func getStableNumGoroutine(t *testing.T) int {
 	return 0
 }
 
+// Check the error channel for an error and if one is present,
+// calls t.Fatal(e.Error()). Note that this supports tests that
+// send nil to the error channel and so report error only if
+// e is != nil.
+func checkErrChannel(t *testing.T, errCh chan error) {
+	t.Helper()
+	select {
+	case e := <-errCh:
+		if e != nil {
+			t.Fatal(e.Error())
+		}
+	default:
+	}
+}
+
 func TestCloseLeakingGoRoutines(t *testing.T) {
 	s := RunDefaultServer()
 	defer s.Shutdown()
@@ -559,7 +574,7 @@ func TestRequestTimeout(t *testing.T) {
 	nc := NewDefaultConnection(t)
 	defer nc.Close()
 
-	if _, err := nc.Request("foo", []byte("help"), 10*time.Millisecond); err == nil {
+	if _, err := nc.Request("foo", []byte("help"), 10*time.Millisecond); err != nats.ErrTimeout {
 		t.Fatalf("Expected to receive a timeout error")
 	}
 }
@@ -636,19 +651,19 @@ func TestSimultaneousRequests(t *testing.T) {
 		nc.Publish(m.Reply, response)
 	})
 
-	var wg sync.WaitGroup
+	wg := sync.WaitGroup{}
+	wg.Add(50)
+	errCh := make(chan error, 50)
 	for i := 0; i < 50; i++ {
-		wg.Add(1)
-		//lint:ignore SA2002 t.Fatalf in go routine will happen only if test fails
 		go func() {
+			defer wg.Done()
 			if _, err := nc.Request("foo", nil, 2*time.Second); err != nil {
-				t.Fatalf("Expected to receive a timeout error")
-			} else {
-				wg.Done()
+				errCh <- fmt.Errorf("expected to receive a timeout error")
 			}
 		}()
 	}
 	wg.Wait()
+	checkErrChannel(t, errCh)
 }
 
 func TestRequestClose(t *testing.T) {

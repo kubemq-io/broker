@@ -698,6 +698,57 @@ func TestSimpleMapping(t *testing.T) {
 	}
 }
 
+// https://github.com/nats-io/nats-server/issues/1159
+func TestStreamImportLengthBug(t *testing.T) {
+	s, fooAcc, barAcc := simpleAccountServer(t)
+	defer s.Shutdown()
+
+	cfoo, _, _ := newClientForServer(s)
+	defer cfoo.nc.Close()
+
+	if err := cfoo.registerWithAccount(fooAcc); err != nil {
+		t.Fatalf("Error registering client with 'foo' account: %v", err)
+	}
+	cbar, _, _ := newClientForServer(s)
+	defer cbar.nc.Close()
+
+	if err := cbar.registerWithAccount(barAcc); err != nil {
+		t.Fatalf("Error registering client with 'bar' account: %v", err)
+	}
+
+	if err := cfoo.acc.AddStreamExport("client.>", nil); err != nil {
+		t.Fatalf("Error adding account export to client foo: %v", err)
+	}
+	if err := cbar.acc.AddStreamImport(fooAcc, "client.>", "events.>"); err == nil {
+		t.Fatalf("Expected an error when using a stream import prefix with a wildcard")
+	}
+
+	if err := cbar.acc.AddStreamImport(fooAcc, "client.>", "events"); err != nil {
+		t.Fatalf("Error adding account import to client bar: %v", err)
+	}
+
+	if err := cbar.parse([]byte("SUB events.> 1\r\n")); err != nil {
+		t.Fatalf("Error for client 'bar' from server: %v", err)
+	}
+
+	// Also make sure that we will get an error from a config version.
+	// JWT will be updated separately.
+	cf := createConfFile(t, []byte(`
+	accounts {
+	  foo {
+	    exports = [{stream: "client.>"}]
+	  }
+	  bar {
+	    imports = [{stream: {account: "foo", subject:"client.>"}, prefix:"events.>"}]
+	  }
+	}
+	`))
+	defer os.Remove(cf)
+	if _, err := ProcessConfigFile(cf); err == nil {
+		t.Fatalf("Expected an error with import with wildcard prefix")
+	}
+}
+
 func TestShadowSubsCleanupOnClientClose(t *testing.T) {
 	s, fooAcc, barAcc := simpleAccountServer(t)
 	defer s.Shutdown()
@@ -1345,7 +1396,7 @@ func TestAccountRequestReplyTrackLatency(t *testing.T) {
 		t.Fatalf("Error adding account service import to client bar: %v", err)
 	}
 
-	// Now setup the resonder under cfoo and the listener for the results
+	// Now setup the responder under cfoo and the listener for the results
 	cfoo.parse([]byte("SUB track.service 1\r\nSUB results 2\r\n"))
 
 	readFooMsg := func() ([]byte, string) {
@@ -2097,12 +2148,30 @@ func TestAccountNoDeadlockOnQueueSubRouteMapUpdate(t *testing.T) {
 	wg.Wait()
 }
 
+func TestAccountDuplicateServiceImportSubject(t *testing.T) {
+	opts := DefaultOptions()
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	fooAcc, _ := s.RegisterAccount("foo")
+	fooAcc.AddServiceExport("remote1", nil)
+	fooAcc.AddServiceExport("remote2", nil)
+
+	barAcc, _ := s.RegisterAccount("bar")
+	if err := barAcc.AddServiceImport(fooAcc, "foo", "remote1"); err != nil {
+		t.Fatalf("Error adding service import: %v", err)
+	}
+	if err := barAcc.AddServiceImport(fooAcc, "foo", "remote2"); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("Expected an error about duplicate service import subject, got %q", err)
+	}
+}
+
 func BenchmarkNewRouteReply(b *testing.B) {
 	opts := defaultServerOptions
 	s := New(&opts)
-	c, _, _ := newClientForServer(s)
+	g := s.globalAccount()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		c.newServiceReply(false)
+		g.newServiceReply(false)
 	}
 }

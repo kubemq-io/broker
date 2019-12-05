@@ -26,8 +26,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/nats"
 	"github.com/nats-io/jwt"
+	"github.com/kubemq-io/broker/client/nats"
 	"github.com/nats-io/nkeys"
 )
 
@@ -99,6 +99,7 @@ func runTrustedCluster(t *testing.T) (*Server, *Options, *Server, *Options, nkey
 	optsA.TrustedKeys = []string{pub}
 	optsA.AccountResolver = mr
 	optsA.SystemAccount = apub
+	optsA.ServerName = "A"
 	// Add in dummy gateway
 	optsA.Gateway.Name = "TEST CLUSTER 22"
 	optsA.Gateway.Host = "127.0.0.1"
@@ -108,6 +109,7 @@ func runTrustedCluster(t *testing.T) (*Server, *Options, *Server, *Options, nkey
 	sa := RunServer(optsA)
 
 	optsB := nextServerOpts(optsA)
+	optsB.ServerName = "B"
 	optsB.Routes = RoutesFromStr(fmt.Sprintf("nats://%s:%d", optsA.Cluster.Host, optsA.Cluster.Port))
 	sb := RunServer(optsB)
 
@@ -1159,6 +1161,21 @@ func TestAccountConnsLimitExceededAfterUpdateDisconnectNewOnly(t *testing.T) {
 	}
 }
 
+func TestSystemAccountWithBadRemoteLatencyUpdate(t *testing.T) {
+	s, _ := runTrustedServer(t)
+	defer s.Shutdown()
+
+	acc, _ := createAccount(s)
+	s.setSystemAccount(acc)
+
+	rl := remoteLatency{
+		Account: "NONSENSE",
+		ReqId:   "_INBOX.22",
+	}
+	b, _ := json.Marshal(&rl)
+	s.remoteLatencyUpdate(nil, nil, "foo", "", b)
+}
+
 func TestSystemAccountWithGateways(t *testing.T) {
 	sa, oa, sb, ob, akp := runTrustedGateways(t)
 	defer sa.Shutdown()
@@ -1322,6 +1339,27 @@ func TestServerEventsStatsZ(t *testing.T) {
 	if lr := len(m3.Stats.Routes); lr != 1 {
 		t.Fatalf("Expected a route, but got %d", lr)
 	}
+	if sr := m3.Stats.Routes[0]; sr.Name != "B" {
+		t.Fatalf("Expected server A's route to B to have Name set to %q, got %q", "B", sr.Name)
+	}
+
+	// Now query B and check that route's name is "A"
+	subj = fmt.Sprintf(serverStatsReqSubj, sb.ID())
+	ncs.SubscribeSync(subj)
+	msg, err = ncs.Request(subj, nil, time.Second)
+	if err != nil {
+		t.Fatalf("Error trying to request statsz: %v", err)
+	}
+	m = ServerStatsMsg{}
+	if err := json.Unmarshal(msg.Data, &m); err != nil {
+		t.Fatalf("Error unmarshalling the statz json: %v", err)
+	}
+	if lr := len(m.Stats.Routes); lr != 1 {
+		t.Fatalf("Expected a route, but got %d", lr)
+	}
+	if sr := m.Stats.Routes[0]; sr.Name != "A" {
+		t.Fatalf("Expected server B's route to A to have Name set to %q, got %q", "A", sr.Name)
+	}
 }
 
 func TestServerEventsPingStatsZ(t *testing.T) {
@@ -1392,77 +1430,6 @@ func (sr *slowAccResolver) Fetch(name string) (string, error) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	return sr.AccountResolver.Fetch(name)
-}
-
-func TestFetchAccountRace(t *testing.T) {
-	sa, oa, sb, ob, _ := runTrustedGateways(t)
-	defer sa.Shutdown()
-	defer sb.Shutdown()
-
-	// Let's create a user account.
-	okp, _ := nkeys.FromSeed(oSeed)
-	akp, _ := nkeys.CreateAccount()
-	pub, _ := akp.PublicKey()
-	nac := jwt.NewAccountClaims(pub)
-	jwt, _ := nac.Encode(okp)
-	userAcc := pub
-
-	// Replace B's account resolver with one that introduces
-	// delay during the Fetch()
-	sac := &slowAccResolver{AccountResolver: sb.AccountResolver()}
-	sb.SetAccountResolver(sac)
-
-	// Add the account in sa and sb
-	addAccountToMemResolver(sa, userAcc, jwt)
-	addAccountToMemResolver(sb, userAcc, jwt)
-
-	// Tell the slow account resolver which account to slow down
-	sac.Lock()
-	sac.acc = userAcc
-	sac.Unlock()
-
-	urlA := fmt.Sprintf("nats://%s:%d", oa.Host, oa.Port)
-	urlB := fmt.Sprintf("nats://%s:%d", ob.Host, ob.Port)
-
-	nca, err := nats.Connect(urlA, createUserCreds(t, sa, akp))
-	if err != nil {
-		t.Fatalf("Error connecting to A: %v", err)
-	}
-	defer nca.Close()
-
-	// Since there is an optimistic send, this message will go to B
-	// and on processing this message, B will lookup/fetch this
-	// account, which can produce race with the fetch of this
-	// account from A's system account that sent a notification
-	// about this account, or with the client connect just after
-	// that.
-	nca.Publish("foo", []byte("hello"))
-
-	// Now connect and create a subscription on B
-	ncb, err := nats.Connect(urlB, createUserCreds(t, sb, akp))
-	if err != nil {
-		t.Fatalf("Error connecting to A: %v", err)
-	}
-	defer ncb.Close()
-	sub, err := ncb.SubscribeSync("foo")
-	if err != nil {
-		t.Fatalf("Error on subscribe: %v", err)
-	}
-
-	// Now send messages from A and B should ultimately start to receive
-	// them (once the subscription has been correctly registered)
-	ok := false
-	for i := 0; i < 10; i++ {
-		nca.Publish("foo", []byte("hello"))
-		if _, err := sub.NextMsg(100 * time.Millisecond); err != nil {
-			continue
-		}
-		ok = true
-		break
-	}
-	if !ok {
-		t.Fatalf("B should be able to receive messages")
-	}
 }
 
 func TestConnectionUpdatesTimerProperlySet(t *testing.T) {

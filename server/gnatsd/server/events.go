@@ -16,6 +16,7 @@ package server
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -122,6 +123,7 @@ type accNumConnsReq struct {
 
 // ServerInfo identifies remote servers.
 type ServerInfo struct {
+	Name    string    `json:"name"`
 	Host    string    `json:"host"`
 	ID      string    `json:"id"`
 	Cluster string    `json:"cluster,omitempty"`
@@ -164,6 +166,7 @@ type ServerStats struct {
 // RouteStat holds route statistics.
 type RouteStat struct {
 	ID       uint64    `json:"rid"`
+	Name     string    `json:"name,omitempty"`
 	Sent     DataStats `json:"sent"`
 	Received DataStats `json:"received"`
 	Pending  int       `json:"pending"`
@@ -215,6 +218,7 @@ func (s *Server) internalSendLoop(wg *sync.WaitGroup) {
 	sendq := s.sys.sendq
 	id := s.info.ID
 	host := s.info.Host
+	servername := s.info.Name
 	seqp := &s.sys.seq
 	var cluster string
 	if s.gateway.enabled {
@@ -230,13 +234,14 @@ func (s *Server) internalSendLoop(wg *sync.WaitGroup) {
 	for s.eventsRunning() {
 		// Setup information for next message
 		if len(sendq) > warnThresh && time.Since(last) >= warnFreq {
-			s.Warnf("Internal system send queue > 75%")
+			s.Warnf("Internal system send queue > 75%%")
 			last = time.Now()
 		}
 
 		select {
 		case pm := <-sendq:
 			if pm.si != nil {
+				pm.si.Name = servername
 				pm.si.Host = host
 				pm.si.Cluster = cluster
 				pm.si.ID = id
@@ -248,8 +253,8 @@ func (s *Server) internalSendLoop(wg *sync.WaitGroup) {
 			if pm.msg != nil {
 				b, _ = json.MarshalIndent(pm.msg, _EMPTY_, "  ")
 			}
-			// We can have an override for account here.
 			c.mu.Lock()
+			// We can have an override for account here.
 			if pm.acc != nil {
 				c.acc = pm.acc
 			} else {
@@ -410,6 +415,9 @@ func routeStat(r *client) *RouteStat {
 		},
 		Pending: int(r.out.pb),
 	}
+	if r.route != nil {
+		rs.Name = r.route.remoteName
+	}
 	r.mu.Unlock()
 	return rs
 }
@@ -484,7 +492,7 @@ func (s *Server) startRemoteServerSweepTimer() {
 }
 
 // Length of our system hash used for server targeted messages.
-const sysHashLen = 4
+const sysHashLen = 6
 
 // This will setup our system wide tracking subs.
 // For now we will setup one wildcard subscription to
@@ -496,11 +504,10 @@ func (s *Server) initEventTracking() {
 	if !s.eventsEnabled() {
 		return
 	}
-	// Create a system hash which we use for other servers to target us
-	// specifically.
+	// Create a system hash which we use for other servers to target us specifically.
 	sha := sha256.New()
 	sha.Write([]byte(s.info.ID))
-	s.sys.shash = fmt.Sprintf("%x", sha.Sum(nil))[:sysHashLen]
+	s.sys.shash = base64.RawURLEncoding.EncodeToString(sha.Sum(nil))[:sysHashLen]
 
 	// This will be for all inbox responses.
 	subject := fmt.Sprintf(inboxRespSubj, s.sys.shash, "*")
@@ -671,10 +678,16 @@ func (s *Server) connsRequest(sub *subscription, _ *client, subject, reply strin
 		s.sys.client.Errorf("Error unmarshalling account connections request message: %v", err)
 		return
 	}
-	acc, _ := s.lookupAccount(m.Account)
+	// Here we really only want to lookup the account if its local. We do not want to fetch this
+	// account if we have no interest in it.
+	var acc *Account
+	if v, ok := s.accounts.Load(m.Account); ok {
+		acc = v.(*Account)
+	}
 	if acc == nil {
 		return
 	}
+	// We know this is a local connection.
 	if nlc := acc.NumLocalConnections(); nlc > 0 {
 		s.mu.Lock()
 		s.sendAccConnsUpdate(acc, reply)
@@ -726,7 +739,15 @@ func (s *Server) remoteConnsUpdate(sub *subscription, _ *client, subject, reply 
 	}
 
 	// See if we have the account registered, if not drop it.
-	acc, _ := s.lookupAccount(m.Account)
+	// Make sure this does not force us to load this account here.
+	var acc *Account
+	if v, ok := s.accounts.Load(m.Account); ok {
+		acc = v.(*Account)
+	}
+	// Silently ignore these if we do not have local interest in the account.
+	if acc == nil {
+		return
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -735,14 +756,9 @@ func (s *Server) remoteConnsUpdate(sub *subscription, _ *client, subject, reply 
 	if !s.running || !s.eventsEnabled() {
 		return
 	}
-
 	// Double check that this is not us, should never happen, so error if it does.
 	if m.Server.ID == s.info.ID {
 		s.sys.client.Errorf("Processing our own account connection event message: ignored")
-		return
-	}
-	if acc == nil {
-		s.sys.client.Debugf("Received account connection event for unknown account: %s", m.Account)
 		return
 	}
 	// If we are here we have interest in tracking this account. Update our accounting.
@@ -750,8 +766,7 @@ func (s *Server) remoteConnsUpdate(sub *subscription, _ *client, subject, reply 
 	s.updateRemoteServer(&m.Server)
 }
 
-// Setup tracking for this account. This allows us to track globally
-// account activity.
+// Setup tracking for this account. This allows us to track global account activity.
 // Lock should be held on entry.
 func (s *Server) enableAccountTracking(a *Account) {
 	if a == nil || !s.eventsEnabled() {
@@ -1037,11 +1052,12 @@ func (s *Server) remoteLatencyUpdate(sub *subscription, _ *client, subject, _ st
 	acc, err := s.LookupAccount(rl.Account)
 	if err != nil {
 		s.Warnf("Could not lookup account %q for latency measurement", rl.Account)
+		return
 	}
 	// Now get the request id / reply. We need to see if we have a GW prefix and if so strip that off.
 	reply := rl.ReqId
-	if subjectStartsWithGatewayReplyPrefix([]byte(reply)) {
-		reply = reply[gwReplyStart:]
+	if gwPrefix, old := isGWRoutedSubjectAndIsOldPrefix([]byte(reply)); gwPrefix {
+		reply = string(getSubjectFromGWRoutedReply([]byte(reply), old))
 	}
 	acc.mu.RLock()
 	si := acc.imports.services[reply]
@@ -1056,14 +1072,14 @@ func (s *Server) remoteLatencyUpdate(sub *subscription, _ *client, subject, _ st
 
 	// So we have not processed the response tracking measurement yet.
 	if m1 == nil {
-		acc.mu.Lock()
+		si.acc.mu.Lock()
 		// Double check since could have slipped in.
 		m1 = si.m1
 		if m1 == nil {
 			// Store our value there for them to pick up.
 			si.m1 = &m2
 		}
-		acc.mu.Unlock()
+		si.acc.mu.Unlock()
 		if m1 == nil {
 			return
 		}
@@ -1076,7 +1092,7 @@ func (s *Server) remoteLatencyUpdate(sub *subscription, _ *client, subject, _ st
 	m1.merge(&m2)
 
 	// Make sure we remove the entry here.
-	si.acc.removeServiceImport(si.from)
+	acc.removeServiceImport(si.from)
 	// Send the metrics
 	s.sendInternalAccountMsg(acc, lsub, &m1)
 }
@@ -1250,7 +1266,7 @@ func (s *Server) debugSubscribers(sub *subscription, c *client, subject, reply s
 		delete(s.sys.replies, replySubj)
 		s.mu.Unlock()
 		// Send the response.
-		s.sendInternalAccountMsg(c.acc, reply, nsubs)
+		s.sendInternalAccountMsg(c.acc, reply, atomic.LoadInt32(&nsubs))
 	}()
 }
 

@@ -20,7 +20,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/kubemq-io/broker/server/gnatsd/server"
 	"math/rand"
 	"net"
 	"os"
@@ -1566,7 +1565,7 @@ func TestNatsURLOption(t *testing.T) {
 	s := RunServer(clusterName)
 	defer s.Shutdown()
 
-	sc, err := Connect(clusterName, clientName, NatsURL("nats://localhost:5555"))
+	sc, err := Connect(clusterName, clientName, NatsURL("nats://127.0.0.1:5555"))
 	if err == nil {
 		sc.Close()
 		t.Fatal("Expected connect to fail")
@@ -1608,7 +1607,7 @@ func TestSubscriptionPending(t *testing.T) {
 	}
 
 	m, b, _ := sub.Pending()
-	// FIXME(jack0) - server streaming appends clientid, guid, and subject to messages so bytes pending is greater than message size
+	// FIXME(jack0) - nats streaming appends clientid, guid, and subject to messages so bytes pending is greater than message size
 	mlen := len(msg) + 19
 	totalSize := total * mlen
 
@@ -1731,11 +1730,12 @@ func TestSlowAsyncSubscriber(t *testing.T) {
 	})
 	// Make sure these are the defaults
 	pm, pb, _ := sub.PendingLimits()
-	if pm != nats.DefaultSubPendingMsgsLimit {
-		t.Fatalf("Pending limit for number of msgs incorrect, expected %d, got %d\n", nats.DefaultSubPendingMsgsLimit, pm)
+	unlimited := -1
+	if pm != unlimited {
+		t.Fatalf("Pending limit for number of msgs incorrect, expected %d, got %d\n", unlimited, pm)
 	}
-	if pb != nats.DefaultSubPendingBytesLimit {
-		t.Fatalf("Pending limit for number of bytes incorrect, expected %d, got %d\n", nats.DefaultSubPendingBytesLimit, pb)
+	if pb != unlimited {
+		t.Fatalf("Pending limit for number of bytes incorrect, expected %d, got %d\n", unlimited, pb)
 	}
 
 	// Set new limits
@@ -1858,7 +1858,7 @@ func TestOptionNatsName(t *testing.T) {
 	nc := sc.NatsConn()
 
 	if n := nc.Opts.Name; n != clientName {
-		t.Fatalf("Unexpected server client name: %s", n)
+		t.Fatalf("Unexpected nats client name: %s", n)
 	}
 }
 
@@ -2215,7 +2215,7 @@ func TestPings(t *testing.T) {
 		t.Fatalf("Expected timer to be nil")
 	}
 	if sc.NatsConn() != nil {
-		t.Fatalf("Expected server conn to be nil")
+		t.Fatalf("Expected nats conn to be nil")
 	}
 
 	s = RunServer(clusterName)
