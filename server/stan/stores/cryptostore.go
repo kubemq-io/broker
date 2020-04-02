@@ -26,8 +26,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/kubemq-io/broker/client/stan/pb"
 	"github.com/kubemq-io/broker/server/stan/util"
+	"github.com/kubemq-io/broker/client/stan/pb"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 

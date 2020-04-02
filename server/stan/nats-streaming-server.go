@@ -24,9 +24,9 @@ import (
 	natsd "github.com/kubemq-io/broker/server/gnatsd/server"
 	stand "github.com/kubemq-io/broker/server/stan/server"
 
-	_ "github.com/go-sql-driver/mysql"                                        // mysql driver
+	_ "github.com/go-sql-driver/mysql"                              // mysql driver
+	_ "github.com/lib/pq"                                           // postgres driver
 	_ "github.com/kubemq-io/broker/server/stan/stores/pqdeadlines" // wrapper for postgres that gives read/write deadlines
-	_ "github.com/lib/pq"                                                     // postgres driver
 )
 
 var usageStr = `
@@ -51,7 +51,7 @@ Streaming Server Options:
     -sl,  --signal <signal>[=<pid>]      Send signal to nats-streaming-server process (stop, quit, reopen)
           --encrypt <bool>               Specify if server should use encryption at rest
           --encryption_cipher <string>   Cipher to use for encryption. Currently support AES and CHAHA (ChaChaPoly). Defaults to AES
-          --encryption_key <sting>       Encryption Key. It is recommended to specify it through the NATS_STREAMING_ENCRYPTION_KEY environment variable instead
+          --encryption_key <string>      Encryption Key. It is recommended to specify it through the NATS_STREAMING_ENCRYPTION_KEY environment variable instead
     
 Streaming Server Clustering Options:
     --clustered <bool>                   Run the server in a clustered configuration (default: false)
@@ -115,7 +115,7 @@ Embedded NATS Server Options:
 Logging Options:
     -l, --log <string>               File to redirect log output
     -T, --logtime=<bool>             Timestamp log entries (default: true)
-    -s, --syslog <string>            Enable syslog as log method
+    -s, --syslog <bool>              Enable syslog as log method
     -r, --remote_syslog <string>     Syslog server addr (udp://localhost:514)
     -D, --debug=<bool>               Enable debugging output
     -V, --trace=<bool>               Trace the raw protocol

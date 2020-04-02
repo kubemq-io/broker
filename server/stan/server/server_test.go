@@ -27,18 +27,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/stan"
-	"github.com/kubemq-io/broker/client/stan/pb"
-	"github.com/kubemq-io/broker/nuid"
 	natsd "github.com/kubemq-io/broker/server/gnatsd/server"
 	"github.com/kubemq-io/broker/server/stan/logger"
 	"github.com/kubemq-io/broker/server/stan/stores"
 	"github.com/kubemq-io/broker/server/stan/test"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/nuid"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/stan/pb"
 
-	_ "github.com/go-sql-driver/mysql"                                        // mysql driver
+	_ "github.com/go-sql-driver/mysql"                              // mysql driver
+	_ "github.com/lib/pq"                                           // postgres driver
 	_ "github.com/kubemq-io/broker/server/stan/stores/pqdeadlines" // wrapper for postgres that gives read/write deadlines
-	_ "github.com/lib/pq"                                                     // postgres driver
 )
 
 const (
@@ -186,6 +186,8 @@ func init() {
 func stackFatalf(t tLogger, f string, args ...interface{}) {
 	msg := fmt.Sprintf(f, args...) + "\n" + stack()
 	t.Fatalf(msg)
+	// For staticcheck SA0511...
+	panic("unreachable code")
 }
 
 func stack() string {
@@ -1122,10 +1124,12 @@ func TestDontSendEmptyMsgProto(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error on connect: %v", err)
 	}
+	defer nc.Close()
 	sc, err := stan.Connect(clusterName, clientName, stan.NatsConn(nc))
 	if err != nil {
 		t.Fatalf("Error on connect: %v", err)
 	}
+	defer sc.Close()
 	// Since server is expected to crash, do not attempt to close sc
 	// because it would delay test by 2 seconds.
 
@@ -1146,8 +1150,8 @@ func TestDontSendEmptyMsgProto(t *testing.T) {
 
 	m := &pb.MsgProto{}
 	sub.Lock()
+	defer sub.Unlock()
 	s.sendMsgToSub(sub, m, false)
-	sub.Unlock()
 }
 
 func TestMsgsNotSentToSubBeforeSubReqResponse(t *testing.T) {

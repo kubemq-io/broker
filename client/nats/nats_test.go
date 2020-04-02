@@ -36,9 +36,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/jwt"
 	"github.com/kubemq-io/broker/server/gnatsd/server"
 	natsserver "github.com/kubemq-io/broker/server/gnatsd/test"
-	"github.com/nats-io/jwt"
 	"github.com/nats-io/nkeys"
 )
 
@@ -259,89 +259,6 @@ func TestReconnectServerStats(t *testing.T) {
 
 	if cur.reconnects != 0 {
 		t.Fatalf("Current Server's reconnects should be 0 vs %d\n", cur.reconnects)
-	}
-}
-
-func TestParseStateReconnectFunctionality(t *testing.T) {
-	ts := RunServerOnPort(TEST_PORT)
-	ch := make(chan bool)
-
-	opts := reconnectOpts
-	dch := make(chan bool)
-	dErrCh := make(chan bool)
-	opts.DisconnectedErrCB = func(_ *Conn, _ error) {
-		dErrCh <- true
-	}
-	opts.DisconnectedCB = func(_ *Conn) {
-		dch <- true
-	}
-
-	nc, errc := opts.Connect()
-	if errc != nil {
-		t.Fatalf("Failed to create a connection: %v\n", errc)
-	}
-	ec, errec := NewEncodedConn(nc, DEFAULT_ENCODER)
-	if errec != nil {
-		nc.Close()
-		t.Fatalf("Failed to create an encoded connection: %v\n", errec)
-	}
-	defer ec.Close()
-
-	testString := "bar"
-	ec.Subscribe("foo", func(s string) {
-		if s != testString {
-			t.Fatal("String doesn't match")
-		}
-		ch <- true
-	})
-	ec.Flush()
-
-	// Got a RACE condition with Travis build. The locking below does not
-	// really help because the parser running in the readLoop accesses
-	// nc.ps without the connection lock. Sleeping may help better since
-	// it would make the memory write in parse.go (when processing the
-	// pong) further away from the modification below.
-	time.Sleep(1 * time.Second)
-
-	// Simulate partialState, this needs to be cleared
-	nc.mu.Lock()
-	nc.ps.state = OP_PON
-	nc.mu.Unlock()
-
-	ts.Shutdown()
-	// server is stopped here...
-
-	if err := Wait(dErrCh); err != nil {
-		t.Fatal("Did not get the DisconnectedErrCB")
-	}
-
-	select {
-	case <-dch:
-		t.Fatal("Get the DEPRECATED DisconnectedCB while DisconnectedErrCB was set")
-	default:
-	}
-
-	if err := ec.Publish("foo", testString); err != nil {
-		t.Fatalf("Failed to publish message: %v\n", err)
-	}
-
-	ts = RunServerOnPort(TEST_PORT)
-	defer ts.Shutdown()
-
-	if err := ec.FlushTimeout(5 * time.Second); err != nil {
-		t.Fatalf("Error on Flush: %v", err)
-	}
-
-	if err := Wait(ch); err != nil {
-		t.Fatal("Did not receive our message")
-	}
-
-	expectedReconnectCount := uint64(1)
-	reconnectedCount := ec.Conn.Stats().Reconnects
-
-	if reconnectedCount != expectedReconnectCount {
-		t.Fatalf("Reconnect count incorrect: %d vs %d\n",
-			reconnectedCount, expectedReconnectCount)
 	}
 }
 
@@ -2306,5 +2223,44 @@ func TestRequestMultipleReplies(t *testing.T) {
 	}
 	if e := <-errCh; e != nil {
 		t.Fatal(e.Error())
+	}
+}
+
+func TestRequestInit(t *testing.T) {
+	o := natsserver.DefaultTestOptions
+	o.Port = -1
+	s := RunServerWithOptions(&o)
+	defer s.Shutdown()
+
+	nc, err := Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	if _, err := nc.Subscribe("foo", func(m *Msg) {
+		m.Respond([]byte("reply"))
+	}); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	// Artificially change the status to something that would make the internal subscribe
+	// call fail. Don't use CLOSED because then there is a risk that the flusher() goes away
+	// and so the rest of the test would fail.
+	nc.mu.Lock()
+	orgStatus := nc.status
+	nc.status = DRAINING_SUBS
+	nc.mu.Unlock()
+
+	if _, err := nc.Request("foo", []byte("request"), 50*time.Millisecond); err == nil {
+		t.Fatal("Expected error, got none")
+	}
+
+	nc.mu.Lock()
+	nc.status = orgStatus
+	nc.mu.Unlock()
+
+	if _, err := nc.Request("foo", []byte("request"), 500*time.Millisecond); err != nil {
+		t.Fatalf("Error on request: %v", err)
 	}
 }

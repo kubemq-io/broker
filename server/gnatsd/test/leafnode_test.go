@@ -15,12 +15,15 @@ package test
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,9 +31,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/jwt"
 	"github.com/kubemq-io/broker/server/gnatsd/logger"
 	"github.com/kubemq-io/broker/server/gnatsd/server"
-	"github.com/nats-io/jwt"
 	"github.com/kubemq-io/broker/client/nats"
 	"github.com/nats-io/nkeys"
 	"github.com/kubemq-io/broker/nuid"
@@ -524,6 +527,7 @@ func TestLeafNodeSolicit(t *testing.T) {
 	s.Shutdown()
 	// Need to restart it on the same port.
 	s, _ = runLeafServerOnPort(opts.LeafNode.Port)
+	defer s.Shutdown()
 	checkLeafNodeConnected(t, s)
 }
 
@@ -559,6 +563,45 @@ func TestLeafNodeNoEcho(t *testing.T) {
 
 	leafSend("LMSG foo 2\r\nOK\r\n")
 	expectNothing(t, lc)
+}
+
+func TestLeafNodeLoop(t *testing.T) {
+	s, opts := runLeafServer()
+	defer s.Shutdown()
+
+	c := createClientConn(t, opts.Host, opts.Port)
+	defer c.Close()
+
+	send, expect := setupConn(t, c)
+	send("PING\r\n")
+	expect(pongRe)
+
+	lc1 := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc1.Close()
+
+	leaf1Send, leaf1Expect := setupLeaf(t, lc1, 1)
+	leaf1Send("PING\r\n")
+	leaf1Expect(pongRe)
+
+	leaf1Send("LS+ $lds.foo\r\n")
+	expectNothing(t, lc1)
+
+	// Same loop detection subscription from same client
+	leaf1Send("LS+ $lds.foo\r\n")
+	expectNothing(t, lc1)
+
+	lc2 := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc2.Close()
+
+	leaf2Send, leaf2Expect := setupLeaf(t, lc2, 2)
+	leaf2Send("PING\r\n")
+	leaf2Expect(pongRe)
+
+	// Same loop detection subscription from different client
+	leaf2Send("LS+ $lds.foo\r\n")
+	leaf2Expect(regexp.MustCompile(
+		"-ERR 'Loop detected for leafnode account=\".G\". " +
+			"Delaying attempt to reconnect for .*"))
 }
 
 // Used to setup clusters of clusters for tests.
@@ -605,7 +648,8 @@ func waitForOutboundGateways(t *testing.T, s *server.Server, expected int, timeo
 	}
 	checkFor(t, timeout, 15*time.Millisecond, func() error {
 		if n := s.NumOutboundGateways(); n != expected {
-			return fmt.Errorf("Expected %v outbound gateway(s), got %v", expected, n)
+			return fmt.Errorf("Expected %v outbound gateway(s), got %v (ulimt -n too low?)",
+				expected, n)
 		}
 		return nil
 	})
@@ -1096,7 +1140,7 @@ func TestLeafNodeTLSMixIP(t *testing.T) {
 	// This will fail but we want to make sure in the correct way, not with
 	// TLS issue because we used an IP for serverName.
 	sl, _ := RunServerWithConfig(slconf)
-	defer s.Shutdown()
+	defer sl.Shutdown()
 
 	ll := &captureLeafNodeErrLogger{ch: make(chan string, 2)}
 	sl.SetLogger(ll, false, false)
@@ -1153,7 +1197,7 @@ func runSolicitWithCredentials(t *testing.T, opts *server.Options, creds string)
 			remotes = [
 				{
 					url: nats-leaf://127.0.0.1:%d
-					credentials: "%s"
+					credentials: '%s'
 				}
 			]
 		}
@@ -2291,6 +2335,7 @@ func TestLeafNodeSendsRemoteSubsOnConnect(t *testing.T) {
 
 	// Need to restart it on the same port.
 	s, _ = runLeafServerOnPort(opts.LeafNode.Port)
+	defer s.Shutdown()
 	checkLeafNodeConnected(t, s)
 
 	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
@@ -2651,6 +2696,11 @@ func TestLeafNodeAndGatewayGlobalRouting(t *testing.T) {
 	})
 	ncl.Flush()
 
+	// Since for leafnodes the account becomes interest-only mode,
+	// let's make sure that the interest on "foo" has time to propagate
+	// to cluster B.
+	time.Sleep(250 * time.Millisecond)
+
 	// Create a direct connect requestor. Try with all possible
 	// servers in cluster B to make sure that we also receive the
 	// reply when the accepting leafnode server does not have
@@ -2674,10 +2724,10 @@ func TestLeafNodeAndGatewayGlobalRouting(t *testing.T) {
 			t.Fatalf("Error on subscribe: %v", err)
 		}
 		if err := nc.PublishRequest("foo", reply, []byte("Hello")); err != nil {
-			t.Fatalf("Failed to get response: %v", err)
+			t.Fatalf("Failed to send request: %v", err)
 		}
 		if _, err := sub.NextMsg(250 * time.Millisecond); err != nil {
-			t.Fatalf("Did not get reply: %v", err)
+			t.Fatalf("Did not get reply from server %d: %v", i, err)
 		}
 		nc.Close()
 	}
@@ -3008,4 +3058,80 @@ func TestLeafNodeDaisyChain(t *testing.T) {
 	if _, err = nc2.Request("ngs.usage", []byte("1h"), time.Second); err != nil {
 		t.Fatalf("Expected a response")
 	}
+}
+
+// This will test failover to a server with a cert with only an IP after successfully connecting
+// to a server with a cert with both.
+func TestClusterTLSMixedIPAndDNS(t *testing.T) {
+	confA := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		leafnodes {
+			listen: "127.0.0.1:-1"
+			tls {
+				cert_file: "./configs/certs/server-iponly.pem"
+				key_file:  "./configs/certs/server-key-iponly.pem"
+				ca_file:   "./configs/certs/ca.pem"
+				timeout: 2
+			}
+		}
+		cluster {
+			listen: "127.0.0.1:-1"
+		}
+	`))
+	srvA, optsA := RunServerWithConfig(confA)
+	defer srvA.Shutdown()
+
+	bConfigTemplate := `
+		listen: 127.0.0.1:-1
+		leafnodes {
+			listen: "localhost:-1"
+			tls {
+				cert_file: "./configs/certs/server-cert.pem"
+				key_file:  "./configs/certs/server-key.pem"
+				ca_file:   "./configs/certs/ca.pem"
+				timeout: 2
+			}
+		}
+		cluster {
+			listen: "127.0.0.1:-1"
+			routes [
+				"nats://%s:%d"
+			]
+		}
+	`
+	confB := createConfFile(t, []byte(fmt.Sprintf(bConfigTemplate,
+		optsA.Cluster.Host, optsA.Cluster.Port)))
+	srvB, optsB := RunServerWithConfig(confB)
+	defer srvB.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB)
+
+	// Solicit a leafnode server here. Don't use the helper since we need verification etc.
+	o := DefaultTestOptions
+	o.Port = -1
+	rurl, _ := url.Parse(fmt.Sprintf("nats-leaf://%s:%d", optsB.LeafNode.Host, optsB.LeafNode.Port))
+	o.LeafNode.ReconnectInterval = 10 * time.Millisecond
+	remote := &server.RemoteLeafOpts{URLs: []*url.URL{rurl}}
+	remote.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	pool := x509.NewCertPool()
+	rootPEM, err := ioutil.ReadFile("./configs/certs/ca.pem")
+	if err != nil || rootPEM == nil {
+		t.Fatalf("Error loading or parsing rootCA file: %v", err)
+	}
+	ok := pool.AppendCertsFromPEM(rootPEM)
+	if !ok {
+		t.Fatalf("Failed to parse root certificate from %q", "./configs/certs/ca.pem")
+	}
+	remote.TLSConfig.RootCAs = pool
+	o.LeafNode.Remotes = []*server.RemoteLeafOpts{remote}
+	sl, _ := RunServer(&o), &o
+	defer sl.Shutdown()
+
+	checkLeafNodeConnected(t, srvB)
+
+	// Now kill off srvB and force client to connect to srvA.
+	srvB.Shutdown()
+
+	// Make sure this works.
+	checkLeafNodeConnected(t, srvA)
 }

@@ -24,11 +24,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/stan"
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/stores"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/nats"
 )
 
 // A mock store that we use to override GetExclusiveLock() behavior.

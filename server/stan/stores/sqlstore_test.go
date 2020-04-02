@@ -25,13 +25,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/stan/pb"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/test"
+	"github.com/kubemq-io/broker/client/stan/pb"
 
-	mysql "github.com/go-sql-driver/mysql"                                    // mysql driver
+	mysql "github.com/go-sql-driver/mysql"                          // mysql driver
+	_ "github.com/lib/pq"                                           // postgres driver
 	_ "github.com/kubemq-io/broker/server/stan/stores/pqdeadlines" // wrapper for postgres that gives read/write deadlines
-	_ "github.com/lib/pq"                                                     // postgres driver
 )
 
 // The SourceAdmin is used by the test setup to have access
@@ -1211,7 +1211,7 @@ func TestSQLSubStoreCachingAndRecovery(t *testing.T) {
 	acks := make(map[uint64]struct{})
 	acks[2] = struct{}{}
 	ackBytes, _ := sqlEncodeSeqs(acks, func(_ uint64) {})
-	stmt := "INSERT INTO SubsPending (subid, row, lastsent, pending, acks) VALUES (?, ?, ?, ?, ?)"
+	stmt := "INSERT INTO SubsPending (subid, `row`, lastsent, pending, acks) VALUES (?, ?, ?, ?, ?)"
 	if testSQLDriver == driverPostgres {
 		stmt = "INSERT INTO SubsPending (subid, row, lastsent, pending, acks) VALUES ($1, $2, $3, $4, $5)"
 	}

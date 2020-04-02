@@ -75,6 +75,12 @@ func TestParseConfig(t *testing.T) {
 	if opts.ClientCA != "/path/to/client/ca_file" {
 		t.Fatalf("Expected ClientCA to be %q, got %q", "/path/to/client/ca_file", opts.ClientCA)
 	}
+	if opts.TLSServerName != "localhost" {
+		t.Fatalf("Expected TLSServerName to be %q, got %q", "localhost", opts.TLSServerName)
+	}
+	if !opts.TLSSkipVerify {
+		t.Fatalf("Expected TLSSkipVerify to be true, got %v", opts.TLSSkipVerify)
+	}
 	if opts.NATSCredentials != "credentials.creds" {
 		t.Fatalf("Expected Credentials to be %q, got %q", "credentials.creds", opts.NATSCredentials)
 	}
@@ -220,6 +226,9 @@ func TestParseConfig(t *testing.T) {
 		if p != peers[i] {
 			t.Fatalf("Expected peer %q, got %q", peers[i], p)
 		}
+	}
+	if !opts.Clustering.ProceedOnRestoreFailure {
+		t.Fatalf("Expected ProceedOnRestoreFailure to be true, got false")
 	}
 	if opts.Clustering.RaftLogPath != "/path/to/log" {
 		t.Fatalf("Expected RaftLogPath to be %q, got %q", "/path/to/log", opts.Clustering.RaftLogPath)
@@ -438,6 +447,8 @@ func TestParseWrongTypes(t *testing.T) {
 	expectFailureFor(t, "tls:{client_cert:123}", wrongTypeErr)
 	expectFailureFor(t, "tls:{client_key:123}", wrongTypeErr)
 	expectFailureFor(t, "tls:{client_ca:123}", wrongTypeErr)
+	expectFailureFor(t, "tls:{server_name:123}", wrongTypeErr)
+	expectFailureFor(t, "tls:{insecure:123}", wrongTypeErr)
 	expectFailureFor(t, "file:{compact:123}", wrongTypeErr)
 	expectFailureFor(t, "file:{compact_frag:false}", wrongTypeErr)
 	expectFailureFor(t, "file:{compact_interval:false}", wrongTypeErr)
@@ -464,6 +475,7 @@ func TestParseWrongTypes(t *testing.T) {
 	expectFailureFor(t, "cluster:{log_snapshots:false}", wrongTypeErr)
 	expectFailureFor(t, "cluster:{trailing_logs:false}", wrongTypeErr)
 	expectFailureFor(t, "cluster:{sync:1}", wrongTypeErr)
+	expectFailureFor(t, "cluster:{proceed_on_restore_failure:123}", wrongTypeErr)
 	expectFailureFor(t, "cluster:{raft_logging:1}", wrongTypeErr)
 	expectFailureFor(t, "cluster:{raft_heartbeat_timeout:123}", wrongTypeErr)
 	expectFailureFor(t, "cluster:{raft_heartbeat_timeout:\"not_a_time\"}", wrongTimeErr)

@@ -22,11 +22,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/stan"
-	"github.com/kubemq-io/broker/client/stan/pb"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/stores"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 // As of now, it is possible for members of the same group to have different
@@ -757,7 +757,10 @@ type queueGroupStalledMsgStore struct {
 }
 
 func (s *queueGroupStalledMsgStore) Lookup(seq uint64) (*pb.MsgProto, error) {
-	s.lookupCh <- struct{}{}
+	select {
+	case s.lookupCh <- struct{}{}:
+	default:
+	}
 	return s.MsgStore.Lookup(seq)
 }
 
@@ -1159,5 +1162,153 @@ func TestQueueNoRedeliveryDuringSubClose(t *testing.T) {
 	case e := <-errCh:
 		t.Fatal(e.Error())
 	default:
+	}
+}
+
+func TestPersistentStoreDurableQueueSubRaceBetweenCreateAndClose(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+
+	opts := getTestDefaultOptsForPersistentStore()
+	s := runServerWithOpts(t, opts, nil)
+	defer shutdownRestartedServerOnTestExit(&s)
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	qsub1, err := sc.QueueSubscribe("foo", "bar", func(_ *stan.Msg) {}, stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	cs := channelsGet(t, s.channels, "foo")
+	ss := &mockedSubStore{SubStore: cs.store.Subs}
+	cs.store.Subs = ss
+
+	// Will make the store create sub pause so that the addition of the new
+	// queue sub in the go routine will be delayed.
+	ss.Lock()
+	ss.ch = make(chan bool, 1)
+	ss.Unlock()
+	closeErrCh := make(chan error)
+	createErrCh := make(chan error)
+
+	sc2, err := stan.Connect(clusterName, clientName+"2")
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer sc2.Close()
+
+	// Since close operation uses a barrier that ensures that
+	// other operations complete, we need to start processing
+	// of qsub1.Close() start before we start the new queue sub,
+	// but ensure that it stops at one point. We will use the
+	// closeMu mutex to artificially block it.
+	s.closeMu.Lock()
+	go func() {
+		closeErrCh <- qsub1.Close()
+	}()
+	// Let the Close() proceed a bit...
+	time.Sleep(100 * time.Millisecond)
+	go func() {
+		_, err := sc2.QueueSubscribe("foo", "bar", func(_ *stan.Msg) {}, stan.DurableName("dur"))
+		createErrCh <- err
+	}()
+
+	// Let the QueueSubscribe() proceed a bit..
+	time.Sleep(100 * time.Millisecond)
+
+	// Now release the qsub1 Close()
+	s.closeMu.Unlock()
+
+	// Let the Close() complete, but we have to release the CreateSub()
+	// blockage from a different go routine otherwise with the fix,
+	// the Close() would still be blocked.
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		// Now release the addition to the subStore of the second queue sub
+		ss.ch <- true
+	}()
+
+	// Wait for the close to complete
+	if err := <-closeErrCh; err != nil {
+		t.Fatalf("Error on close: %v", err)
+	}
+	// Wait for create to complete
+	if err := <-createErrCh; err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	// Now close 2nd queue sub (connection close will do that for us)
+	sc2.Close()
+	// We don't need that connection either.
+	sc.Close()
+
+	// Shutdown and restart the server and make sure that we did not
+	// introduce a 2nd shadow subscription.
+	s.Shutdown()
+	l := &captureWarnLogger{}
+	opts.CustomLogger = l
+	s = runServerWithOpts(t, opts, nil)
+
+	cs = channelsGet(t, s.channels, "foo")
+	qs := cs.ss.qsubs["dur:bar"]
+	qs.RLock()
+	hasShadow := qs.shadow != nil
+	qs.RUnlock()
+	if !hasShadow {
+		t.Fatalf("Should have a shadow subscription")
+	}
+	var hasDuplicate bool
+	l.Lock()
+	for _, w := range l.warnings {
+		if strings.Contains(w, "Duplicate shadow durable") {
+			hasDuplicate = true
+			break
+		}
+	}
+	l.Unlock()
+	if hasDuplicate {
+		t.Fatalf("Duplicate shadow subscription found!")
+	}
+}
+
+func TestQueueRedeliveryCount(t *testing.T) {
+	s := runServer(t, clusterName)
+	defer s.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	errCh := make(chan error, 2)
+	var mu sync.Mutex
+	var prev uint32
+	cb := func(m *stan.Msg) {
+		if m.Redelivered {
+			mu.Lock()
+			if m.RedeliveryCount != prev+1 {
+				m.Sub.Close()
+				errCh <- fmt.Errorf("previous was %v, current %v", prev, m.RedeliveryCount)
+				mu.Unlock()
+				return
+			}
+			prev = m.RedeliveryCount
+			mu.Unlock()
+		}
+	}
+
+	for i := 0; i < 2; i++ {
+		if _, err := sc.QueueSubscribe("foo", "bar", cb, stan.AckWait(ackWaitInMs(50)), stan.SetManualAckMode()); err != nil {
+			t.Fatalf("Error on subscribe: %v", err)
+		}
+	}
+
+	sc.Publish("foo", []byte("msg"))
+
+	select {
+	case e := <-errCh:
+		t.Fatal(e.Error())
+	case <-time.After(500 * time.Millisecond):
+		// ok!
 	}
 }

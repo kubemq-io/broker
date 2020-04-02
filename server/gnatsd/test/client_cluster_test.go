@@ -121,6 +121,8 @@ func TestServerRestartReSliceIssue(t *testing.T) {
 // of server restarts.
 func TestServerRestartAndQueueSubs(t *testing.T) {
 	srvA, srvB, optsA, optsB := runServers(t)
+	defer srvA.Shutdown()
+	defer srvB.Shutdown()
 
 	urlA := fmt.Sprintf("nats://%s:%d/", optsA.Host, optsA.Port)
 	urlB := fmt.Sprintf("nats://%s:%d/", optsB.Host, optsB.Port)
@@ -140,28 +142,22 @@ func TestServerRestartAndQueueSubs(t *testing.T) {
 
 	// Helper to wait on a reconnect.
 	waitOnReconnect := func() {
-		var rcs int64
-		for {
-			select {
-			case <-reconnectsDone:
-				atomic.AddInt64(&rcs, 1)
-				if rcs >= 2 {
-					return
-				}
-			case <-time.After(2 * time.Second):
-				t.Fatalf("Expected a reconnect, timedout!\n")
-			}
+		t.Helper()
+		select {
+		case <-reconnectsDone:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("Expected a reconnect, timedout!\n")
 		}
 	}
 
 	// Create two clients..
-	opts.Servers = []string{urlA}
+	opts.Servers = []string{urlA, urlB}
 	nc1, err := opts.Connect()
 	if err != nil {
 		t.Fatalf("Failed to create connection for nc1: %v\n", err)
 	}
 
-	opts.Servers = []string{urlB}
+	opts.Servers = []string{urlB, urlA}
 	nc2, err := opts.Connect()
 	if err != nil {
 		t.Fatalf("Failed to create connection for nc2: %v\n", err)
@@ -254,14 +250,19 @@ func TestServerRestartAndQueueSubs(t *testing.T) {
 	////////////////////////////////////////////////////////////////////////////
 
 	srvA.Shutdown()
+	// Wait for client on A to reconnect to B.
+	waitOnReconnect()
+
 	srvA = RunServer(optsA)
 	defer srvA.Shutdown()
 
 	srvB.Shutdown()
+	// Now both clients should reconnect to A.
+	waitOnReconnect()
+	waitOnReconnect()
+
 	srvB = RunServer(optsB)
 	defer srvB.Shutdown()
-
-	waitOnReconnect()
 
 	// Make sure the cluster is reformed
 	checkClusterFormed(t, srvA, srvB)
@@ -319,7 +320,9 @@ func TestRequestsAcrossRoutes(t *testing.T) {
 	// Make sure the route and the subscription are propagated.
 	nc1.Flush()
 
-	checkExpectedSubs(1, srvA, srvB)
+	if err := checkExpectedSubs(1, srvA, srvB); err != nil {
+		t.Fatalf(err.Error())
+	}
 
 	var resp string
 
@@ -368,7 +371,9 @@ func TestRequestsAcrossRoutesToQueues(t *testing.T) {
 		nc2.Publish(m.Reply, response)
 	})
 
-	checkExpectedSubs(2, srvA, srvB)
+	if err := checkExpectedSubs(2, srvA, srvB); err != nil {
+		t.Fatalf(err.Error())
+	}
 
 	var resp string
 
@@ -381,6 +386,92 @@ func TestRequestsAcrossRoutesToQueues(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		if err := ec1.Request("foo-req", i, &resp, 500*time.Millisecond); err != nil {
 			t.Fatalf("Received an error on Request test [%d]: %s", i, err)
+		}
+	}
+}
+
+// This is in response to Issue #1144
+// https://github.com/nats-io/nats-server/issues/1144
+func TestQueueDistributionAcrossRoutes(t *testing.T) {
+	srvA, srvB, _, _ := runServers(t)
+	defer srvA.Shutdown()
+	defer srvB.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB)
+
+	urlA := srvA.ClientURL()
+	urlB := srvB.ClientURL()
+
+	nc1, err := nats.Connect(urlA)
+	if err != nil {
+		t.Fatalf("Failed to create connection for nc1: %v\n", err)
+	}
+	defer nc1.Close()
+
+	nc2, err := nats.Connect(urlB)
+	if err != nil {
+		t.Fatalf("Failed to create connection for nc2: %v\n", err)
+	}
+	defer nc2.Close()
+
+	var qsubs []*nats.Subscription
+
+	// Connect queue subscriptions as mentioned in the issue. 2(A) - 6(B) - 4(A)
+	for i := 0; i < 2; i++ {
+		sub, _ := nc1.QueueSubscribeSync("foo", "bar")
+		qsubs = append(qsubs, sub)
+	}
+	nc1.Flush()
+	for i := 0; i < 6; i++ {
+		sub, _ := nc2.QueueSubscribeSync("foo", "bar")
+		qsubs = append(qsubs, sub)
+	}
+	nc2.Flush()
+	for i := 0; i < 4; i++ {
+		sub, _ := nc1.QueueSubscribeSync("foo", "bar")
+		qsubs = append(qsubs, sub)
+	}
+	nc1.Flush()
+
+	if err := checkExpectedSubs(7, srvA, srvB); err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	send := 10000
+	for i := 0; i < send; i++ {
+		nc2.Publish("foo", nil)
+	}
+	nc2.Flush()
+
+	tp := func() int {
+		var total int
+		for i := 0; i < len(qsubs); i++ {
+			pending, _, _ := qsubs[i].Pending()
+			total += pending
+		}
+		return total
+	}
+
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		if total := tp(); total != send {
+			return fmt.Errorf("Number of total received %d", total)
+		}
+		return nil
+	})
+
+	// The bug is essentially that when we deliver across a route, we
+	// prefer locals, but if we randomize to a block of bounce backs, then
+	// we walk to the end and find the same local for all the remote options.
+	// So what you will see in this case is a large value at #9 (2+6, next one local).
+
+	avg := send / len(qsubs)
+	for i := 0; i < len(qsubs); i++ {
+		total, _, _ := qsubs[i].Pending()
+		if total > avg+(avg*3/10) {
+			if i == 8 {
+				t.Fatalf("Qsub in 8th position gets majority of the messages (prior 6 spots) in this test")
+			}
+			t.Fatalf("Received too high, %d vs %d", total, avg)
 		}
 	}
 }

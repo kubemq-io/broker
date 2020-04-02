@@ -24,16 +24,17 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/raft"
-	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/stan"
-	"github.com/kubemq-io/broker/client/stan/pb"
 	natsd "github.com/kubemq-io/broker/server/gnatsd/server"
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
 	"github.com/kubemq-io/broker/server/stan/stores"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 const (
@@ -45,12 +46,12 @@ const (
 )
 
 var defaultMonitorOptions = natsd.Options{
-	Host:     "localhost",
+	Host:     "127.0.0.1",
 	Port:     4222,
 	HTTPHost: monitorHost,
 	HTTPPort: monitorPort,
 	Cluster: natsd.ClusterOpts{
-		Host: "localhost",
+		Host: "127.0.0.1",
 		Port: 6222,
 	},
 	NoLog:  true,
@@ -374,6 +375,48 @@ func TestMonitorServerz(t *testing.T) {
 	c := channelsLookupOrCreate(t, s, "foo")
 	c.store.Msgs = &msgStoreFailMsgState{MsgStore: c.store.Msgs}
 	monitorExpectStatus(t, ServerPath, http.StatusInternalServerError)
+}
+
+func TestMonitorIsFTActiveFTServer(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		checkActive    bool
+		expectedStatus int
+	}{
+		{"active", true, http.StatusOK},
+		{"standby", false, http.StatusNoContent},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetPreviousHTTPConnections()
+
+			cleanupFTDatastore(t)
+			defer cleanupFTDatastore(t)
+
+			nopts := defaultMonitorOptions
+			var aNOpts *natsd.Options
+			var sNOpts *natsd.Options
+
+			if test.checkActive {
+				aNOpts = &nopts
+			} else {
+				sNOpts = &nopts
+			}
+
+			opts := getTestFTDefaultOptions()
+			active := runServerWithOpts(t, opts, aNOpts)
+			defer active.Shutdown()
+
+			getFTActiveServer(t, active)
+
+			opts = getTestFTDefaultOptions()
+			opts.NATSServerURL = "nats://127.0.0.1:4222"
+			standby := runServerWithOpts(t, opts, sNOpts)
+			defer standby.Shutdown()
+
+			resp, _ := getBodyEx(t, http.DefaultClient, "http", IsFTActivePath, test.expectedStatus, "")
+			defer resp.Body.Close()
+		})
+	}
 }
 
 func TestMonitorUptime(t *testing.T) {
@@ -1211,7 +1254,7 @@ func TestMonitorClusterRole(t *testing.T) {
 				t.Fatalf("Got an error unmarshalling the body: %v", err)
 			}
 			if sz.Role != test.expectedRole {
-				t.Fatalf("Expected role to be %v, gt %v", test.expectedRole, sz.Role)
+				t.Fatalf("Expected role to be %v, got %v", test.expectedRole, sz.Role)
 			}
 		})
 	}
@@ -1325,4 +1368,67 @@ func TestMonitorNumSubs(t *testing.T) {
 	qsub1.Unsubscribe()
 	dur.Unsubscribe()
 	checkNumSubs(t, 0)
+}
+
+func TestMonitorInOutMsgs(t *testing.T) {
+	resetPreviousHTTPConnections()
+	s := runMonitorServer(t, GetDefaultOptions())
+	defer s.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	mch := make(chan *stan.Msg, 5)
+	count := int32(0)
+	if _, err := sc.Subscribe("foo", func(m *stan.Msg) {
+		atomic.AddInt32(&count, 1)
+		if !m.Redelivered {
+			select {
+			case mch <- m:
+			default:
+			}
+		}
+	},
+		stan.SetManualAckMode(),
+		stan.AckWait(ackWaitInMs(500))); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {
+		atomic.AddInt32(&count, 1)
+	}); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		sc.Publish("foo", []byte("msg"))
+	}
+
+	resp, body := getBody(t, ServerPath, expectedJSON)
+	resp.Body.Close()
+	sz := Serverz{}
+	if err := json.Unmarshal(body, &sz); err != nil {
+		t.Fatalf("Got an error unmarshalling the body: %v", err)
+	}
+	if sz.InMsgs != 5 || sz.InBytes == 0 {
+		t.Fatalf("Expected 5 inbound messages, got %v - %v", sz.InMsgs, sz.InBytes)
+	}
+	if sz.OutMsgs != 10 || sz.OutBytes == 0 {
+		t.Fatalf("Expected 10 outbound messages, got %v - %v", sz.InMsgs, sz.InBytes)
+	}
+
+	time.Sleep(700 * time.Millisecond)
+
+	resp, body = getBody(t, ServerPath, expectedJSON)
+	resp.Body.Close()
+	sz = Serverz{}
+	if err := json.Unmarshal(body, &sz); err != nil {
+		t.Fatalf("Got an error unmarshalling the body: %v", err)
+	}
+	if sz.InMsgs != 5 || sz.InBytes == 0 {
+		t.Fatalf("Expected 5 inbound messages, got %v - %v", sz.InMsgs, sz.InBytes)
+	}
+	if sz.OutMsgs != 15 || sz.OutBytes == 0 {
+		t.Fatalf("Expected 15 outbound messages, got %v - %v", sz.InMsgs, sz.InBytes)
+	}
 }

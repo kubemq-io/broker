@@ -1,4 +1,4 @@
-// Copyright 2012-2019 The NATS Authors
+// Copyright 2012-2020 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -301,7 +301,7 @@ func TestParsePubArg(t *testing.T) {
 			subject: "foo", reply: "", size: 2222, szb: "2222"},
 	} {
 		t.Run(test.arg, func(t *testing.T) {
-			if err := c.processPub(false, []byte(test.arg)); err != nil {
+			if err := c.processPub([]byte(test.arg)); err != nil {
 				t.Fatalf("Unexpected parse error: %v\n", err)
 			}
 			if !bytes.Equal(c.pa.subject, []byte(test.subject)) {
@@ -324,7 +324,7 @@ func TestParsePubBadSize(t *testing.T) {
 	c := dummyClient()
 	// Setup localized max payload
 	c.mpay = 32768
-	if err := c.processPub(false, []byte("foo 2222222222222222")); err == nil {
+	if err := c.processPub([]byte("foo 2222222222222222")); err == nil {
 		t.Fatalf("Expected parse error for size too large")
 	}
 }
@@ -582,7 +582,7 @@ func TestMaxControlLine(t *testing.T) {
 
 	pub := []byte("PUB foo.bar 11\r")
 	err := c.parse(pub)
-	if err != ErrMaxControlLine {
+	if !ErrorIs(err, ErrMaxControlLine) {
 		t.Fatalf("Expected an error parsing longer than expected control line")
 	}
 }

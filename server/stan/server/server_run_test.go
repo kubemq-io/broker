@@ -14,6 +14,7 @@
 package server
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"os"
@@ -25,12 +26,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/stan"
 	natsd "github.com/kubemq-io/broker/server/gnatsd/server"
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/stores"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/nats"
 )
 
 func TestRunServer(t *testing.T) {
@@ -77,6 +78,9 @@ func TestRunServerFailureLogsCause(t *testing.T) {
 }
 
 func TestServerLoggerDebugAndTrace(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
 	sOpts := GetDefaultOptions()
 	sOpts.EnableLogging = true
 	sOpts.Debug = true
@@ -90,19 +94,19 @@ func TestServerLoggerDebugAndTrace(t *testing.T) {
 	}()
 	os.Stderr = w
 	done := make(chan bool, 1)
-	buf := make([]byte, 1024)
+	buf := make([]byte, 10000)
 	out := make([]byte, 0)
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for {
+			n, _ := r.Read(buf)
+			out = append(out, buf[:n]...)
 			select {
 			case <-done:
 				return
 			default:
-				n, _ := r.Read(buf)
-				out = append(out, buf[:n]...)
 			}
 		}
 	}()
@@ -397,6 +401,109 @@ func TestTLSFailClientTLSServerPlain(t *testing.T) {
 		t.Fatal("Expected server to fail to start, it did not")
 	}
 }
+
+func TestTLSServerNameAndSkipVerify(t *testing.T) {
+	nOpts := DefaultNatsServerOptions
+
+	nOpts.Host = "0.0.0.0"
+	nOpts.TLSCert = "../test/certs/server-noip.pem"
+	nOpts.TLSKey = "../test/certs/server-key-noip.pem"
+	nOpts.TLSCaCert = "../test/certs/ca.pem"
+
+	sOpts := GetDefaultOptions()
+	sOpts.ClientCert = "../test/certs/client-cert.pem"
+	sOpts.ClientKey = "../test/certs/client-key.pem"
+	sOpts.ClientCA = "../test/certs/ca.pem"
+
+	s, err := RunServerWithOpts(sOpts, &nOpts)
+	if s != nil || err == nil {
+		s.Shutdown()
+		t.Fatal("Expected server to fail to start, it did not")
+	}
+
+	sOpts.TLSServerName = "localhost"
+	s, err = RunServerWithOpts(sOpts, &nOpts)
+	if err != nil {
+		t.Fatalf("Expected server to start ok, got %v", err)
+	}
+	s.Shutdown()
+	s = nil
+
+	sOpts.TLSServerName = ""
+	s, err = RunServerWithOpts(sOpts, &nOpts)
+	if s != nil || err == nil {
+		s.Shutdown()
+		t.Fatal("Expected server to fail to start, it did not")
+	}
+
+	sOpts.TLSSkipVerify = true
+	s, err = RunServerWithOpts(sOpts, &nOpts)
+	if err != nil {
+		t.Fatalf("Expected server to start ok, got %v", err)
+	}
+	s.Shutdown()
+
+	// With insecure, all client cert/key/ca can be removed
+	// and connections should still succeed
+	sOpts.ClientCert, sOpts.ClientKey, sOpts.ClientCA = "", "", ""
+	s, err = RunServerWithOpts(sOpts, &nOpts)
+	if err != nil {
+		t.Fatalf("Expected server to start ok, got %v", err)
+	}
+	s.Shutdown()
+
+	// However, it should fail if NATS Server requires client cert verification
+	nOpts.TLSVerify = true
+	s, err = RunServerWithOpts(sOpts, &nOpts)
+	if s != nil || err == nil {
+		s.Shutdown()
+		t.Fatal("Expected server to fail to start, it did not")
+	}
+}
+
+func TestTLSServerNameAndSkipVerifyConflicts(t *testing.T) {
+	nOpts := DefaultNatsServerOptions
+
+	nOpts.Host = "0.0.0.0"
+	nOpts.TLSCert = "../test/certs/server-noip.pem"
+	nOpts.TLSKey = "../test/certs/server-key-noip.pem"
+	nOpts.TLSCaCert = "../test/certs/ca.pem"
+
+	sOpts := GetDefaultOptions()
+	sOpts.NATSClientOpts = []nats.Option{nats.Secure(&tls.Config{ServerName: "localhost"})}
+	sOpts.ClientCert = "../test/certs/client-cert.pem"
+	sOpts.ClientKey = "../test/certs/client-key.pem"
+	sOpts.ClientCA = "../test/certs/ca.pem"
+	sOpts.TLSServerName = "confict"
+
+	s, err := RunServerWithOpts(sOpts, &nOpts)
+	if s != nil || err == nil {
+		s.Shutdown()
+		t.Fatal("Expected server to fail to start, it did not")
+	}
+	if !strings.Contains(err.Error(), "conflict between") {
+		t.Fatalf("Error should indicate conflict, got %v", err)
+	}
+	sOpts.TLSServerName = ""
+	s, err = RunServerWithOpts(sOpts, &nOpts)
+	if err != nil {
+		t.Fatalf("Unable to start server: %v", err)
+	}
+	s.Shutdown()
+
+	// Pass skip verify as a NATS option
+	sOpts.NATSClientOpts = []nats.Option{nats.Secure(&tls.Config{InsecureSkipVerify: true})}
+	// Use the wrong name for streaming TLSServerName
+	sOpts.TLSServerName = "wrong"
+	// And make sure that NATS Option skip veriy is not overridden with that..
+	sOpts.TLSSkipVerify = false
+	s, err = RunServerWithOpts(sOpts, &nOpts)
+	if err != nil {
+		t.Fatalf("Unable to start server: %v", err)
+	}
+	s.Shutdown()
+}
+
 func TestDontEmbedNATSNotRunning(t *testing.T) {
 	sOpts := GetDefaultOptions()
 	// Make sure that with empty string (normally the default), we
@@ -422,7 +529,7 @@ func TestDontEmbedNATSRunning(t *testing.T) {
 	sOpts.NATSServerURL = "nats://localhost:5223"
 
 	nOpts := DefaultNatsServerOptions
-	nOpts.Host = "localhost"
+	nOpts.Host = "127.0.0.1"
 	nOpts.Port = 5223
 	natsd := natsdTest.RunServer(&nOpts)
 	defer natsd.Shutdown()
@@ -915,6 +1022,7 @@ func TestGhostDurableSubs(t *testing.T) {
 	waitForNumClients(t, s, 0)
 
 	// Change store to simulate no flush on simulated crash
+	orgStore := s.store
 	s.store = &storeNoClose{Store: s.store}
 	s.Shutdown()
 
@@ -923,6 +1031,7 @@ func TestGhostDurableSubs(t *testing.T) {
 	check(false)
 
 	sc.Close()
+	orgStore.Close()
 }
 
 func TestGetNATSOptions(t *testing.T) {

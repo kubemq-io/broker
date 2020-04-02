@@ -20,12 +20,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/stan"
-	"github.com/kubemq-io/broker/client/stan/pb"
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
 	"github.com/kubemq-io/broker/server/stan/stores"
 	"github.com/kubemq-io/broker/server/stan/test"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 func testStalledDelivery(t *testing.T, typeSub string) {

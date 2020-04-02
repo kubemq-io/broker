@@ -301,6 +301,9 @@ func TestConnz(t *testing.T) {
 		if len(ci.Subs) != 0 {
 			t.Fatalf("Expected subs of 0, got %v\n", ci.Subs)
 		}
+		if len(ci.SubsDetail) != 0 {
+			t.Fatalf("Expected subsdetail of 0, got %v\n", ci.SubsDetail)
+		}
 		if ci.InMsgs != 1 {
 			t.Fatalf("Expected InMsgs of 1, got %v\n", ci.InMsgs)
 		}
@@ -373,6 +376,57 @@ func TestConnzWithSubs(t *testing.T) {
 		ci := c.Conns[0]
 		if len(ci.Subs) != 1 || ci.Subs[0] != "hello.foo" {
 			t.Fatalf("Expected subs of 1, got %v\n", ci.Subs)
+		}
+	}
+}
+
+func TestConnzWithSubsDetail(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	nc := createClientConnSubscribeAndPublish(t, s)
+	defer nc.Close()
+
+	nc.Subscribe("hello.foo", func(m *nats.Msg) {})
+	ensureServerActivityRecorded(t, nc)
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		c := pollConz(t, s, mode, url+"connz?subs=detail", &ConnzOptions{SubscriptionsDetail: true})
+		// Test inside details of each connection
+		ci := c.Conns[0]
+		if len(ci.SubsDetail) != 1 || ci.SubsDetail[0].Subject != "hello.foo" {
+			t.Fatalf("Expected subsdetail of 1, got %v\n", ci.Subs)
+		}
+	}
+}
+
+func TestClosedConnzWithSubsDetail(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	nc := createClientConnSubscribeAndPublish(t, s)
+
+	nc.Subscribe("hello.foo", func(m *nats.Msg) {})
+	ensureServerActivityRecorded(t, nc)
+	nc.Close()
+
+	s.mu.Lock()
+	for len(s.clients) != 0 {
+		s.mu.Unlock()
+		<-time.After(100 * time.Millisecond)
+		s.mu.Lock()
+	}
+	s.mu.Unlock()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		c := pollConz(t, s, mode, url+"connz?state=closed&subs=detail", &ConnzOptions{State: ConnClosed,
+			SubscriptionsDetail: true})
+		// Test inside details of each connection
+		ci := c.Conns[0]
+		if len(ci.SubsDetail) != 1 || ci.SubsDetail[0].Subject != "hello.foo" {
+			t.Fatalf("Expected subsdetail of 1, got %v\n", ci.Subs)
 		}
 	}
 }
@@ -489,7 +543,8 @@ func TestConnzRTT(t *testing.T) {
 		if rtt <= 0 {
 			t.Fatal("Expected RTT to be valid and non-zero\n")
 		}
-		if rtt > 20*time.Millisecond || rtt < 100*time.Nanosecond {
+		if (runtime.GOOS == "windows" && rtt > 20*time.Millisecond) ||
+			rtt > 20*time.Millisecond || rtt < 100*time.Nanosecond {
 			t.Fatalf("Invalid RTT of %s\n", ci.RTT)
 		}
 	}
@@ -507,6 +562,11 @@ func TestConnzLastActivity(t *testing.T) {
 	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
 	url += "connz?subs=1"
 	opts := &ConnzOptions{Subscriptions: true}
+
+	var sleepTime time.Duration
+	if runtime.GOOS == "windows" {
+		sleepTime = 10 * time.Millisecond
+	}
 
 	testActivity := func(mode int) {
 		ncFoo := createClientConnWithName(t, "foo", s)
@@ -536,6 +596,8 @@ func TestConnzLastActivity(t *testing.T) {
 		ensureServerActivityRecorded(t, ncFoo)
 		ensureServerActivityRecorded(t, ncBar)
 
+		time.Sleep(sleepTime)
+
 		// Sub should trigger update.
 		sub, _ := ncFoo.Subscribe("hello.world", func(m *nats.Msg) {})
 		ensureServerActivityRecorded(t, ncFoo)
@@ -546,6 +608,8 @@ func TestConnzLastActivity(t *testing.T) {
 			t.Fatalf("Subscribe should have triggered update to LastActivity %+v\n", ciFoo)
 		}
 		fooLA = nextLA
+
+		time.Sleep(sleepTime)
 
 		// Publish and Message Delivery should trigger as well. So both connections
 		// should have updates.
@@ -567,6 +631,8 @@ func TestConnzLastActivity(t *testing.T) {
 			t.Fatalf("Message delivery should have triggered update to LastActivity\n")
 		}
 		fooLA = nextLA
+
+		time.Sleep(sleepTime)
 
 		// Unsub should trigger as well
 		sub.Unsubscribe()
@@ -1214,10 +1280,10 @@ func TestConnzWithRoutes(t *testing.T) {
 	checkExpectedSubs(t, 1, s, sc)
 
 	// Now check routez
-	urls := []string{"routez", "routez?subs=1"}
+	urls := []string{"routez", "routez?subs=1", "routez?subs=detail"}
 	for subs, urlSuffix := range urls {
 		for mode := 0; mode < 2; mode++ {
-			rz := pollRoutez(t, s, mode, url+urlSuffix, &RoutezOptions{Subscriptions: subs == 1})
+			rz := pollRoutez(t, s, mode, url+urlSuffix, &RoutezOptions{Subscriptions: subs == 1, SubscriptionsDetail: subs == 2})
 
 			if rz.NumRoutes != 1 {
 				t.Fatalf("Expected 1 route, got %d\n", rz.NumRoutes)
@@ -1238,9 +1304,13 @@ func TestConnzWithRoutes(t *testing.T) {
 				if len(route.Subs) != 0 {
 					t.Fatalf("There should not be subs, got %v", len(route.Subs))
 				}
-			} else {
-				if len(route.Subs) != 1 {
+			} else if subs == 1 {
+				if len(route.Subs) != 1 && len(route.SubsDetail) != 0 {
 					t.Fatalf("There should be 1 sub, got %v", len(route.Subs))
+				}
+			} else if subs == 2 {
+				if len(route.SubsDetail) != 1 && len(route.Subs) != 0 {
+					t.Fatalf("There should be 1 sub, got %v", len(route.SubsDetail))
 				}
 			}
 		}
@@ -1413,6 +1483,7 @@ func TestHandleRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Expected no error: Got %v\n", err)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("Expected a %d response, got %d\n", http.StatusOK, resp.StatusCode)
 	}
@@ -1431,7 +1502,6 @@ func TestHandleRoot(t *testing.T) {
 	if !strings.Contains(ct, "text/html") {
 		t.Fatalf("Expected text/html response, got %s\n", ct)
 	}
-	defer resp.Body.Close()
 }
 
 func TestConnzWithNamedClient(t *testing.T) {
@@ -1736,6 +1806,7 @@ func TestConcurrentMonitoring(t *testing.T) {
 					ech <- fmt.Sprintf("Expected no error: Got %v\n", err)
 					return
 				}
+				defer resp.Body.Close()
 				if resp.StatusCode != http.StatusOK {
 					ech <- fmt.Sprintf("Expected a %v response, got %d\n", http.StatusOK, resp.StatusCode)
 					return
@@ -1745,7 +1816,6 @@ func TestConcurrentMonitoring(t *testing.T) {
 					ech <- fmt.Sprintf("Expected application/json content-type, got %s\n", ct)
 					return
 				}
-				defer resp.Body.Close()
 				if _, err := ioutil.ReadAll(resp.Body); err != nil {
 					ech <- fmt.Sprintf("Got an error reading the body: %v\n", err)
 					return
@@ -2079,6 +2149,7 @@ func Benchmark_VarzHttp(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Expected no error: Got %v\n", err)
 		}
+		defer resp.Body.Close()
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
 			b.Fatalf("Got an error reading the body: %v\n", err)
@@ -2653,6 +2724,7 @@ func TestMonitorGatewayz(t *testing.T) {
 	ob2 := testDefaultOptionsForGateway("B")
 	ob2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", sb1.ClusterAddr().Port))
 	sb2 := runGatewayServer(ob2)
+	defer sb2.Shutdown()
 
 	// Wait for sb1 and sb2 to connect
 	checkClusterFormed(t, sb1, sb2)
@@ -3134,8 +3206,7 @@ func TestMonitorGatewayzAccounts(t *testing.T) {
 }
 
 func TestMonitorRouteRTT(t *testing.T) {
-	// Do not change default PingInterval and expect RTT
-	// to still be reported
+	// Do not change default PingInterval and expect RTT to still be reported
 
 	ob := DefaultOptions()
 	sb := RunServer(ob)
@@ -3242,12 +3313,12 @@ func TestMonitorLeafz(t *testing.T) {
 				{
 					account: "%s"
 					url: nats-leaf://127.0.0.1:%d
-					credentials: "%s"
+					credentials: '%s'
 				}
 				{
 					account: "%s"
 					url: nats-leaf://127.0.0.1:%d
-					credentials: "%s"
+					credentials: '%s'
 				}
 			]
 		}

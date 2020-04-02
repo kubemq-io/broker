@@ -16,10 +16,8 @@ package main
 import (
 	"flag"
 	"fmt"
-	"os"
-	"runtime"
-
 	"github.com/kubemq-io/broker/server/gnatsd/server"
+	"os"
 )
 
 var usageStr = `
@@ -44,7 +42,9 @@ Logging Options:
     -r, --remote_syslog <addr>       Syslog server addr (udp://localhost:514)
     -D, --debug                      Enable debugging output
     -V, --trace                      Trace the raw protocol
+    -VV                              Verbose trace (traces system account as well) 
     -DV                              Debug and trace
+    -DVV                             Debug and verbose trace (traces system account as well) 
 
 Authorization Options:
         --user <user>                User required for connections
@@ -110,5 +110,5 @@ func main() {
 	if err := server.Run(s); err != nil {
 		server.PrintAndDie(err.Error())
 	}
-	runtime.Goexit()
+	s.WaitForShutdown()
 }

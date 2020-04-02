@@ -17,8 +17,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/server/stan/spb"
+	"github.com/kubemq-io/broker/client/nats"
 )
 
 // Number of bytes used to encode a channel name

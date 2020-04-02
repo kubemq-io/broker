@@ -16,12 +16,14 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -103,7 +105,8 @@ func RunServerWithConfig(configFile string) (srv *Server, opts *Options) {
 
 func TestVersionMatchesTag(t *testing.T) {
 	tag := os.Getenv("TRAVIS_TAG")
-	if tag == "" {
+	// Travis started to return '' when no tag is set. Support both now.
+	if tag == "" || tag == "''" {
 		t.SkipNow()
 	}
 	// We expect a tag of the form vX.Y.Z. If that's not the case,
@@ -159,6 +162,26 @@ func TestStartupAndShutdown(t *testing.T) {
 	}
 }
 
+func TestTLSVersions(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		value    uint16
+		expected string
+	}{
+		{"1.0", tls.VersionTLS10, "1.0"},
+		{"1.1", tls.VersionTLS11, "1.1"},
+		{"1.2", tls.VersionTLS12, "1.2"},
+		{"1.3", tls.VersionTLS13, "1.3"},
+		{"unknown", 0x999, "Unknown [0x999]"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if v := tlsVersion(test.value); v != test.expected {
+				t.Fatalf("Expected value 0x%x to be %q, got %q", test.value, test.expected, v)
+			}
+		})
+	}
+}
+
 func TestTlsCipher(t *testing.T) {
 	if strings.Compare(tlsCipher(0x0005), "TLS_RSA_WITH_RC4_128_SHA") != 0 {
 		t.Fatalf("Invalid tls cipher")
@@ -205,8 +228,17 @@ func TestTlsCipher(t *testing.T) {
 	if strings.Compare(tlsCipher(0xc02c), "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384") != 0 {
 		t.Fatalf("Invalid tls cipher")
 	}
-	if !strings.Contains(tlsCipher(0x9999), "Unknown") {
-		t.Fatalf("Expected an unknown cipher.")
+	if strings.Compare(tlsCipher(0x1301), "TLS_AES_128_GCM_SHA256") != 0 {
+		t.Fatalf("Invalid tls cipher")
+	}
+	if strings.Compare(tlsCipher(0x1302), "TLS_AES_256_GCM_SHA384") != 0 {
+		t.Fatalf("Invalid tls cipher")
+	}
+	if strings.Compare(tlsCipher(0x1303), "TLS_CHACHA20_POLY1305_SHA256") != 0 {
+		t.Fatalf("Invalid tls cipher")
+	}
+	if strings.Compare(tlsCipher(0x9999), "Unknown [0x9999]") != 0 {
+		t.Fatalf("Expected an unknown cipher")
 	}
 }
 
@@ -490,55 +522,6 @@ func TestProcessCommandLineArgs(t *testing.T) {
 	}
 }
 
-func TestWriteDeadline(t *testing.T) {
-	opts := DefaultOptions()
-	opts.WriteDeadline = 30 * time.Millisecond
-	s := RunServer(opts)
-	defer s.Shutdown()
-
-	c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", opts.Host, opts.Port), 3*time.Second)
-	if err != nil {
-		t.Fatalf("Error on connect: %v", err)
-	}
-	defer c.Close()
-	if _, err := c.Write([]byte("CONNECT {}\r\nPING\r\nSUB foo 1\r\n")); err != nil {
-		t.Fatalf("Error sending protocols to server: %v", err)
-	}
-	// Reduce socket buffer to increase reliability of getting
-	// write deadline errors.
-	c.(*net.TCPConn).SetReadBuffer(4)
-
-	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
-	sender, err := nats.Connect(url)
-	if err != nil {
-		t.Fatalf("Error on connect: %v", err)
-	}
-	defer sender.Close()
-
-	payload := make([]byte, 1000000)
-	for i := 0; i < 10; i++ {
-		if err := sender.Publish("foo", payload); err != nil {
-			t.Fatalf("Error on publish: %v", err)
-		}
-	}
-	// Flush sender connection to ensure that all data has been sent.
-	if err := sender.Flush(); err != nil {
-		t.Fatalf("Error on flush: %v", err)
-	}
-
-	// At this point server should have closed connection c.
-
-	// On certain platforms, it may take more than one call before
-	// getting the error.
-	for i := 0; i < 100; i++ {
-		if _, err := c.Write([]byte("PUB bar 5\r\nhello\r\n")); err != nil {
-			// ok
-			return
-		}
-	}
-	t.Fatal("Connection should have been closed")
-}
-
 func TestRandomPorts(t *testing.T) {
 	opts := DefaultOptions()
 	opts.HTTPPort = -1
@@ -747,6 +730,16 @@ func TestLameDuckMode(t *testing.T) {
 	checkClientsCount(t, srvB, total)
 
 	// Check closed status on server A
+	// Connections are saved in go routines, so although we have evaluated the number
+	// of connections in the server A to be 0, the polling of connection closed may
+	// need a bit more time.
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		cz := pollConz(t, srvA, 1, "", &ConnzOptions{State: ConnClosed})
+		if n := len(cz.Conns); n != total {
+			return fmt.Errorf("expected %v closed connections, got %v", total, n)
+		}
+		return nil
+	})
 	cz := pollConz(t, srvA, 1, "", &ConnzOptions{State: ConnClosed})
 	if n := len(cz.Conns); n != total {
 		t.Fatalf("Expected %v closed connections, got %v", total, n)
@@ -794,7 +787,7 @@ func TestLameDuckMode(t *testing.T) {
 	checkClientsCount(t, srvA, 0)
 	checkClientsCount(t, srvB, total)
 
-	if elapsed > optsA.LameDuckDuration {
+	if elapsed > time.Duration(float64(optsA.LameDuckDuration)*1.1) {
 		t.Fatalf("Expected to not take more than %v, got %v", optsA.LameDuckDuration, elapsed)
 	}
 
@@ -1205,6 +1198,12 @@ func TestInsecureSkipVerifyWarning(t *testing.T) {
 }
 
 func TestConnectErrorReports(t *testing.T) {
+	// On Windows, an attempt to connect to a port that has no listener will
+	// take whatever timeout specified in DialTimeout() before failing.
+	// So skip for now.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
 	// Check that default report attempts is as expected
 	opts := DefaultOptions()
 	s := RunServer(opts)
@@ -1364,6 +1363,12 @@ func TestConnectErrorReports(t *testing.T) {
 }
 
 func TestReconnectErrorReports(t *testing.T) {
+	// On Windows, an attempt to connect to a port that has no listener will
+	// take whatever timeout specified in DialTimeout() before failing.
+	// So skip for now.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
 	// Check that default report attempts is as expected
 	opts := DefaultOptions()
 	s := RunServer(opts)

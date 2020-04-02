@@ -202,7 +202,7 @@ func Benchmark_____________PubSub(b *testing.B) {
 	doDefaultConnect(b, c)
 	sendProto(b, c, "SUB foo 1\r\n")
 	bw := bufio.NewWriterSize(c, defaultSendBufSize)
-	sendOp := []byte(fmt.Sprintf("PUB foo 2\r\nok\r\n"))
+	sendOp := []byte("PUB foo 2\r\nok\r\n")
 	ch := make(chan bool)
 	expected := len("MSG foo 1 2\r\nok\r\n") * b.N
 	go drainConnection(b, c, ch, expected)
@@ -239,7 +239,7 @@ func Benchmark_____PubSubTwoConns(b *testing.B) {
 	sendProto(b, c2, "SUB foo 1\r\n")
 	flushConnection(b, c2)
 
-	sendOp := []byte(fmt.Sprintf("PUB foo 2\r\nok\r\n"))
+	sendOp := []byte("PUB foo 2\r\nok\r\n")
 	ch := make(chan bool)
 
 	expected := len("MSG foo 1 2\r\nok\r\n") * b.N
@@ -305,7 +305,7 @@ func Benchmark___PubSubAccsImport(b *testing.B) {
 	go drainConnection(b, sub, ch, expected)
 
 	bw := bufio.NewWriterSize(pub, defaultSendBufSize)
-	sendOp := []byte(fmt.Sprintf("PUB foo 2\r\nok\r\n"))
+	sendOp := []byte("PUB foo 2\r\nok\r\n")
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -319,6 +319,113 @@ func Benchmark___PubSubAccsImport(b *testing.B) {
 	// Wait for connection to be drained
 	<-ch
 	b.StopTimer()
+}
+
+func Benchmark_____PubTwoQueueSub(b *testing.B) {
+	b.StopTimer()
+	s := runBenchServer()
+	c := createClientConn(b, "127.0.0.1", PERF_PORT)
+	doDefaultConnect(b, c)
+	sendProto(b, c, "SUB foo group1 1\r\n")
+	sendProto(b, c, "SUB foo group1 2\r\n")
+	bw := bufio.NewWriterSize(c, defaultSendBufSize)
+	sendOp := []byte("PUB foo 2\r\nok\r\n")
+	ch := make(chan bool)
+	expected := len("MSG foo 1 2\r\nok\r\n") * b.N
+	go drainConnection(b, c, ch, expected)
+	b.StartTimer()
+
+	for i := 0; i < b.N; i++ {
+		_, err := bw.Write(sendOp)
+		if err != nil {
+			b.Fatalf("Received error on PUB write: %v\n", err)
+		}
+	}
+	err := bw.Flush()
+	if err != nil {
+		b.Fatalf("Received error on FLUSH write: %v\n", err)
+	}
+
+	// Wait for connection to be drained
+	<-ch
+
+	b.StopTimer()
+	c.Close()
+	s.Shutdown()
+}
+
+func Benchmark____PubFourQueueSub(b *testing.B) {
+	b.StopTimer()
+	s := runBenchServer()
+	c := createClientConn(b, "127.0.0.1", PERF_PORT)
+	doDefaultConnect(b, c)
+	sendProto(b, c, "SUB foo group1 1\r\n")
+	sendProto(b, c, "SUB foo group1 2\r\n")
+	sendProto(b, c, "SUB foo group1 3\r\n")
+	sendProto(b, c, "SUB foo group1 4\r\n")
+	bw := bufio.NewWriterSize(c, defaultSendBufSize)
+	sendOp := []byte("PUB foo 2\r\nok\r\n")
+	ch := make(chan bool)
+	expected := len("MSG foo 1 2\r\nok\r\n") * b.N
+	go drainConnection(b, c, ch, expected)
+	b.StartTimer()
+
+	for i := 0; i < b.N; i++ {
+		_, err := bw.Write(sendOp)
+		if err != nil {
+			b.Fatalf("Received error on PUB write: %v\n", err)
+		}
+	}
+	err := bw.Flush()
+	if err != nil {
+		b.Fatalf("Received error on FLUSH write: %v\n", err)
+	}
+
+	// Wait for connection to be drained
+	<-ch
+
+	b.StopTimer()
+	c.Close()
+	s.Shutdown()
+}
+
+func Benchmark___PubEightQueueSub(b *testing.B) {
+	b.StopTimer()
+	s := runBenchServer()
+	c := createClientConn(b, "127.0.0.1", PERF_PORT)
+	doDefaultConnect(b, c)
+	sendProto(b, c, "SUB foo group1 1\r\n")
+	sendProto(b, c, "SUB foo group1 2\r\n")
+	sendProto(b, c, "SUB foo group1 3\r\n")
+	sendProto(b, c, "SUB foo group1 4\r\n")
+	sendProto(b, c, "SUB foo group1 5\r\n")
+	sendProto(b, c, "SUB foo group1 6\r\n")
+	sendProto(b, c, "SUB foo group1 7\r\n")
+	sendProto(b, c, "SUB foo group1 8\r\n")
+	bw := bufio.NewWriterSize(c, defaultSendBufSize)
+	sendOp := []byte("PUB foo 2\r\nok\r\n")
+	ch := make(chan bool)
+	expected := len("MSG foo 1 2\r\nok\r\n") * b.N
+	go drainConnection(b, c, ch, expected)
+	b.StartTimer()
+
+	for i := 0; i < b.N; i++ {
+		_, err := bw.Write(sendOp)
+		if err != nil {
+			b.Fatalf("Received error on PUB write: %v\n", err)
+		}
+	}
+	err := bw.Flush()
+	if err != nil {
+		b.Fatalf("Received error on FLUSH write: %v\n", err)
+	}
+
+	// Wait for connection to be drained
+	<-ch
+
+	b.StopTimer()
+	c.Close()
+	s.Shutdown()
 }
 
 func Benchmark_PubSub512kTwoConns(b *testing.B) {
@@ -360,113 +467,6 @@ func Benchmark_PubSub512kTwoConns(b *testing.B) {
 	s.Shutdown()
 }
 
-func Benchmark_____PubTwoQueueSub(b *testing.B) {
-	b.StopTimer()
-	s := runBenchServer()
-	c := createClientConn(b, "127.0.0.1", PERF_PORT)
-	doDefaultConnect(b, c)
-	sendProto(b, c, "SUB foo group1 1\r\n")
-	sendProto(b, c, "SUB foo group1 2\r\n")
-	bw := bufio.NewWriterSize(c, defaultSendBufSize)
-	sendOp := []byte(fmt.Sprintf("PUB foo 2\r\nok\r\n"))
-	ch := make(chan bool)
-	expected := len("MSG foo 1 2\r\nok\r\n") * b.N
-	go drainConnection(b, c, ch, expected)
-	b.StartTimer()
-
-	for i := 0; i < b.N; i++ {
-		_, err := bw.Write(sendOp)
-		if err != nil {
-			b.Fatalf("Received error on PUB write: %v\n", err)
-		}
-	}
-	err := bw.Flush()
-	if err != nil {
-		b.Fatalf("Received error on FLUSH write: %v\n", err)
-	}
-
-	// Wait for connection to be drained
-	<-ch
-
-	b.StopTimer()
-	c.Close()
-	s.Shutdown()
-}
-
-func Benchmark____PubFourQueueSub(b *testing.B) {
-	b.StopTimer()
-	s := runBenchServer()
-	c := createClientConn(b, "127.0.0.1", PERF_PORT)
-	doDefaultConnect(b, c)
-	sendProto(b, c, "SUB foo group1 1\r\n")
-	sendProto(b, c, "SUB foo group1 2\r\n")
-	sendProto(b, c, "SUB foo group1 3\r\n")
-	sendProto(b, c, "SUB foo group1 4\r\n")
-	bw := bufio.NewWriterSize(c, defaultSendBufSize)
-	sendOp := []byte(fmt.Sprintf("PUB foo 2\r\nok\r\n"))
-	ch := make(chan bool)
-	expected := len("MSG foo 1 2\r\nok\r\n") * b.N
-	go drainConnection(b, c, ch, expected)
-	b.StartTimer()
-
-	for i := 0; i < b.N; i++ {
-		_, err := bw.Write(sendOp)
-		if err != nil {
-			b.Fatalf("Received error on PUB write: %v\n", err)
-		}
-	}
-	err := bw.Flush()
-	if err != nil {
-		b.Fatalf("Received error on FLUSH write: %v\n", err)
-	}
-
-	// Wait for connection to be drained
-	<-ch
-
-	b.StopTimer()
-	c.Close()
-	s.Shutdown()
-}
-
-func Benchmark___PubEightQueueSub(b *testing.B) {
-	b.StopTimer()
-	s := runBenchServer()
-	c := createClientConn(b, "127.0.0.1", PERF_PORT)
-	doDefaultConnect(b, c)
-	sendProto(b, c, "SUB foo group1 1\r\n")
-	sendProto(b, c, "SUB foo group1 2\r\n")
-	sendProto(b, c, "SUB foo group1 3\r\n")
-	sendProto(b, c, "SUB foo group1 4\r\n")
-	sendProto(b, c, "SUB foo group1 5\r\n")
-	sendProto(b, c, "SUB foo group1 6\r\n")
-	sendProto(b, c, "SUB foo group1 7\r\n")
-	sendProto(b, c, "SUB foo group1 8\r\n")
-	bw := bufio.NewWriterSize(c, defaultSendBufSize)
-	sendOp := []byte(fmt.Sprintf("PUB foo 2\r\nok\r\n"))
-	ch := make(chan bool)
-	expected := len("MSG foo 1 2\r\nok\r\n") * b.N
-	go drainConnection(b, c, ch, expected)
-	b.StartTimer()
-
-	for i := 0; i < b.N; i++ {
-		_, err := bw.Write(sendOp)
-		if err != nil {
-			b.Fatalf("Received error on PUB write: %v\n", err)
-		}
-	}
-	err := bw.Flush()
-	if err != nil {
-		b.Fatalf("Received error on FLUSH write: %v\n", err)
-	}
-
-	// Wait for connection to be drained
-	<-ch
-
-	b.StopTimer()
-	c.Close()
-	s.Shutdown()
-}
-
 func Benchmark__DenyMsgNoWCPubSub(b *testing.B) {
 	s, opts := RunServerWithConfig("./configs/authorization.conf")
 	opts.DisableShortFirstPing = true
@@ -481,7 +481,7 @@ func Benchmark__DenyMsgNoWCPubSub(b *testing.B) {
 
 	sendProto(b, c, "SUB foo 1\r\n")
 	bw := bufio.NewWriterSize(c, defaultSendBufSize)
-	sendOp := []byte(fmt.Sprintf("PUB foo 2\r\nok\r\n"))
+	sendOp := []byte("PUB foo 2\r\nok\r\n")
 	ch := make(chan bool)
 	expected := len("MSG foo 1 2\r\nok\r\n") * b.N
 	go drainConnection(b, c, ch, expected)
@@ -519,7 +519,7 @@ func Benchmark_DenyMsgYesWCPubSub(b *testing.B) {
 
 	sendProto(b, c, "SUB * 1\r\n")
 	bw := bufio.NewWriterSize(c, defaultSendBufSize)
-	sendOp := []byte(fmt.Sprintf("PUB foo 2\r\nok\r\n"))
+	sendOp := []byte("PUB foo 2\r\nok\r\n")
 	ch := make(chan bool)
 	expected := len("MSG foo 1 2\r\nok\r\n") * b.N
 	go drainConnection(b, c, ch, expected)
@@ -872,10 +872,6 @@ func doFanIn(b *testing.B, numServers, numPublishers, numSubscribers int, subjec
 		b.Fatalf("numSubscribers should be <= 10")
 	}
 
-	if b.N%numPublishers != 0 {
-		b.Fatalf("b.N (%d) / numPublishers (%d) has a remainder", b.N, numPublishers)
-	}
-
 	var s1, s2 *server.Server
 	var o1, o2 *server.Options
 
@@ -897,7 +893,8 @@ func doFanIn(b *testing.B, numServers, numPublishers, numSubscribers int, subjec
 	}
 
 	msgOp := fmt.Sprintf("MSG %s %d %d\r\n%s\r\n", subject, 9, len(payload), payload)
-	expected := len(msgOp) * b.N
+	l := b.N / numPublishers
+	expected := len(msgOp) * l * numPublishers
 
 	// Client connections and subscriptions. For fan in these are smaller then numPublishers.
 	clients := make([]chan bool, 0, numSubscribers)
@@ -917,7 +914,6 @@ func doFanIn(b *testing.B, numServers, numPublishers, numSubscribers int, subjec
 
 	sendOp := []byte(fmt.Sprintf("PUB %s %d\r\n%s\r\n", subject, len(payload), payload))
 	startCh := make(chan bool)
-	l := b.N / numPublishers
 
 	pubLoop := func(c net.Conn, ch chan bool) {
 		bw := bufio.NewWriterSize(c, defaultSendBufSize)
@@ -1048,9 +1044,10 @@ func gatewaysBench(b *testing.B, optimisticMode bool, payload string, numPublish
 	ch := make(chan bool)
 	var msgOp string
 	var expected int
+	l := b.N / numPublishers
 	if subInterest {
 		msgOp = fmt.Sprintf("MSG foo 2 %d\r\n%s\r\n", len(payload), payload)
-		expected = len(msgOp) * b.N
+		expected = len(msgOp) * l * numPublishers
 	}
 	// Last message sent to end.test
 	lastMsg := "MSG end.test 1 2\r\nok\r\n"
@@ -1059,7 +1056,6 @@ func gatewaysBench(b *testing.B, optimisticMode bool, payload string, numPublish
 
 	sendOp := []byte(fmt.Sprintf("PUB foo %d\r\n%s\r\n", len(payload), payload))
 	startCh := make(chan bool)
-	l := b.N / numPublishers
 
 	lastMsgSendOp := []byte("PUB end.test 2\r\nok\r\n")
 

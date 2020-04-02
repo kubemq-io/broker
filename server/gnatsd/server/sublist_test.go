@@ -1043,6 +1043,32 @@ func TestSublistAll(t *testing.T) {
 	}
 }
 
+func TestIsSubsetMatch(t *testing.T) {
+	for _, test := range []struct {
+		subject string
+		test    string
+		result  bool
+	}{
+		{"foo.*", ">", true},
+		{"foo.*", "*.*", true},
+		{"foo.*", "foo.*", true},
+		{"foo.*", "foo.bar", false},
+		{"foo.>", ">", true},
+		{"foo.>", "*.>", true},
+		{"foo.>", "foo.>", true},
+		{"foo.>", "foo.bar", false},
+		{"foo..bar", "foo.*", false}, // Bad subject, we return false
+		{"foo.*", "foo..bar", false}, // Bad subject, we return false
+	} {
+		t.Run("", func(t *testing.T) {
+			if res := subjectIsSubsetMatch(test.subject, test.test); res != test.result {
+				t.Fatalf("Subject %q subset match of %q, should be %v, got %v",
+					test.test, test.subject, test.result, res)
+			}
+		})
+	}
+}
+
 // -- Benchmarks Setup --
 
 var benchSublistSubs []*subscription
@@ -1051,10 +1077,6 @@ var benchSublistSl = NewSublistWithCache()
 // https://github.com/golang/go/issues/31859
 func TestMain(m *testing.M) {
 	flag.Parse()
-	os.Exit(m.Run())
-}
-
-func init() {
 	initSublist := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "test.bench" {
@@ -1070,6 +1092,7 @@ func init() {
 		}
 		addWildcards()
 	}
+	os.Exit(m.Run())
 }
 
 func subsInit(pre string, toks []string) {

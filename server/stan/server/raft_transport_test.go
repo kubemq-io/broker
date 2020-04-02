@@ -25,9 +25,9 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
-	"github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/server/gnatsd/server"
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
+	"github.com/kubemq-io/broker/client/nats"
 )
 
 type testAddrProvider struct {

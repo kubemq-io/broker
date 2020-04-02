@@ -31,9 +31,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/stan/pb"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/util"
+	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 var (

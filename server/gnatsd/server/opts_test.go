@@ -1142,6 +1142,54 @@ func TestMalformedClusterAddress(t *testing.T) {
 	}
 }
 
+func TestPanic(t *testing.T) {
+	conf := createConfFile(t, []byte(`port: "this_string_trips_a_panic"`))
+	defer os.Remove(conf)
+	opts, err := ProcessConfigFile(conf)
+	if err == nil {
+		t.Fatalf("Expected an error reading config file: got %+v", opts)
+	} else {
+		if !strings.Contains(err.Error(), ":1:0: interface conversion:") {
+			t.Fatalf("This was supposed to trip a panic on interface conversion right at the beginning")
+		}
+	}
+}
+
+func TestPingIntervalOld(t *testing.T) {
+	conf := createConfFile(t, []byte(`ping_interval: 5`))
+	defer os.Remove(conf)
+	opts := &Options{}
+	err := opts.ProcessConfigFile(conf)
+	if err == nil {
+		t.Fatalf("expected an error")
+	}
+	errTyped, ok := err.(*processConfigErr)
+	if !ok {
+		t.Fatalf("expected an error of type processConfigErr")
+	}
+	if len(errTyped.warnings) != 1 {
+		t.Fatalf("expected processConfigErr to have one warning")
+	}
+	if len(errTyped.errors) != 0 {
+		t.Fatalf("expected processConfigErr to have no error")
+	}
+	if opts.PingInterval != 5*time.Second {
+		t.Fatalf("expected ping interval to be 5 seconds")
+	}
+}
+
+func TestPingIntervalNew(t *testing.T) {
+	conf := createConfFile(t, []byte(`ping_interval: "5m"`))
+	defer os.Remove(conf)
+	opts := &Options{}
+	if err := opts.ProcessConfigFile(conf); err != nil {
+		t.Fatalf("expected no error")
+	}
+	if opts.PingInterval != 5*time.Minute {
+		t.Fatalf("expected ping interval to be 5 minutes")
+	}
+}
+
 func TestOptionsProcessConfigFile(t *testing.T) {
 	// Create options with default values of Debug and Trace
 	// that are the opposite of what is in the config file.
@@ -2341,7 +2389,7 @@ func TestExpandPath(t *testing.T) {
 			{path: "/Foo/Bar", userProfile: `C:\Foo\Bar`, wantPath: "/Foo/Bar"},
 			{path: "Foo/Bar", userProfile: `C:\Foo\Bar`, wantPath: "Foo/Bar"},
 			{path: "~/Fizz", userProfile: `C:\Foo\Bar`, wantPath: `C:\Foo\Bar\Fizz`},
-			{path: `${HOMEDRIVE}${HOMEPATH}\Fizz`, userProfile: `C:\Foo\Bar`, wantPath: `C:\Foo\Bar\Fizz`},
+			{path: `${HOMEDRIVE}${HOMEPATH}\Fizz`, homeDrive: `C:`, homePath: `\Foo\Bar`, wantPath: `C:\Foo\Bar\Fizz`},
 
 			// Missing USERPROFILE.
 			{path: "~/Fizz", homeDrive: "X:", homePath: `\Foo\Bar`, wantPath: `X:\Foo\Bar\Fizz`},

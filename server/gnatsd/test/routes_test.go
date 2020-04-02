@@ -492,6 +492,9 @@ func TestRouteResendsLocalSubsOnReconnect(t *testing.T) {
 	// Close and then re-open
 	route.Close()
 
+	// Give some time for the route close to be processed before trying to recreate.
+	checkNumRoutes(t, s, 0)
+
 	route = createRouteConn(t, opts.Cluster.Host, opts.Cluster.Port)
 	defer route.Close()
 
@@ -811,6 +814,7 @@ func TestRouteSendAsyncINFOToClients(t *testing.T) {
 	// For this test, be explicit about listen spec.
 	opts.Host = "127.0.0.1"
 	opts.Port = 5242
+	opts.DisableShortFirstPing = true
 
 	f(opts)
 	opts.Cluster.NoAdvertise = true

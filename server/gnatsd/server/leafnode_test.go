@@ -1,4 +1,4 @@
-// Copyright 2019 The NATS Authors
+// Copyright 2019-2020 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,8 +14,11 @@
 package server
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -779,4 +782,236 @@ func TestLeafNodeLoop(t *testing.T) {
 	defer sb.Shutdown()
 
 	checkLeafNodeConnected(t, sa)
+}
+
+func TestLeafNodeLoopFromDAG(t *testing.T) {
+	// we want A point to B and B to A.
+	oa := DefaultOptions()
+	oa.LeafNode.ReconnectInterval = 10 * time.Millisecond
+	oa.LeafNode.Port = -1
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+
+	la := &captureErrorLogger{errCh: make(chan string, 10)}
+	sa.SetLogger(la, false, false)
+	ua, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", oa.LeafNode.Port))
+
+	ob := DefaultOptions()
+	ob.LeafNode.ReconnectInterval = 10 * time.Millisecond
+	ob.LeafNode.Port = -1
+	ob.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{ua}}}
+	sb := RunServer(ob)
+	defer sb.Shutdown()
+
+	lb := &captureErrorLogger{errCh: make(chan string, 10)}
+	sb.SetLogger(lb, false, false)
+	ub, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", ob.LeafNode.Port))
+
+	checkLeafNodeConnected(t, sa)
+	checkLeafNodeConnected(t, sb)
+
+	oc := DefaultOptions()
+	oc.LeafNode.ReconnectInterval = 10 * time.Millisecond
+	oc.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{ua}}, {URLs: []*url.URL{ub}}}
+	sc := RunServer(oc)
+	// logger with channel can only be specified after startup and is thus not used
+
+	// either error channel (for a or b) may get the error, but not both.
+	errCnt := 0
+
+errorLoop:
+	for {
+		select {
+		case e := <-la.errCh:
+			if !strings.Contains(e, "Loop") {
+				t.Fatalf("Expected error about loop, got %v", e)
+			}
+			errCnt++
+		case e := <-lb.errCh:
+			if !strings.Contains(e, "Loop") {
+				t.Fatalf("Expected error about loop, got %v", e)
+			}
+			errCnt++
+		case <-time.After(2 * time.Second):
+			if errCnt != 1 {
+				t.Fatalf("Did not get any error regarding loop")
+			}
+			break errorLoop
+		}
+	}
+
+	sc.Shutdown()
+	oc.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{ub}}}
+	sc = RunServer(oc)
+	defer sc.Shutdown()
+
+	checkLeafNodeConnected(t, sa)
+	checkLeafNodeConnectedCnt(t, sb, 2)
+	checkLeafNodeConnected(t, sc)
+}
+
+func TestLeafCloseTLSConnection(t *testing.T) {
+	opts := DefaultOptions()
+	opts.DisableShortFirstPing = true
+	opts.LeafNode.Host = "127.0.0.1"
+	opts.LeafNode.Port = -1
+	opts.LeafNode.TLSTimeout = 100
+	tc := &TLSConfigOpts{
+		CertFile: "./configs/certs/server.pem",
+		KeyFile:  "./configs/certs/key.pem",
+		Insecure: true,
+	}
+	tlsConf, err := GenTLSConfig(tc)
+	if err != nil {
+		t.Fatalf("Error generating tls config: %v", err)
+	}
+	opts.LeafNode.TLSConfig = tlsConf
+	opts.NoLog = true
+	opts.NoSigs = true
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	endpoint := fmt.Sprintf("%s:%d", opts.LeafNode.Host, opts.LeafNode.Port)
+	conn, err := net.DialTimeout("tcp", endpoint, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error on dial: %v", err)
+	}
+	defer conn.Close()
+
+	br := bufio.NewReaderSize(conn, 100)
+	if _, err := br.ReadString('\n'); err != nil {
+		t.Fatalf("Unexpected error reading INFO: %v", err)
+	}
+
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	defer tlsConn.Close()
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("Unexpected error during handshake: %v", err)
+	}
+	connectOp := []byte("CONNECT {\"name\":\"leaf\",\"verbose\":false,\"pedantic\":false,\"tls_required\":true}\r\n")
+	if _, err := tlsConn.Write(connectOp); err != nil {
+		t.Fatalf("Unexpected error writing CONNECT: %v", err)
+	}
+	infoOp := []byte("INFO {\"server_id\":\"leaf\",\"tls_required\":true}\r\n")
+	if _, err := tlsConn.Write(infoOp); err != nil {
+		t.Fatalf("Unexpected error writing CONNECT: %v", err)
+	}
+	if _, err := tlsConn.Write([]byte("PING\r\n")); err != nil {
+		t.Fatalf("Unexpected error writing PING: %v", err)
+	}
+
+	checkLeafNodeConnected(t, s)
+
+	// Get leaf connection
+	var leaf *client
+	s.mu.Lock()
+	for _, l := range s.leafs {
+		leaf = l
+		break
+	}
+	s.mu.Unlock()
+	// Fill the buffer. We want to timeout on write so that nc.Close()
+	// would block due to a write that cannot complete.
+	buf := make([]byte, 64*1024)
+	done := false
+	for !done {
+		leaf.nc.SetWriteDeadline(time.Now().Add(time.Second))
+		if _, err := leaf.nc.Write(buf); err != nil {
+			done = true
+		}
+		leaf.nc.SetWriteDeadline(time.Time{})
+	}
+	ch := make(chan bool)
+	go func() {
+		select {
+		case <-ch:
+			return
+		case <-time.After(3 * time.Second):
+			fmt.Println("!!!! closeConnection is blocked, test will hang !!!")
+			return
+		}
+	}()
+	// Close the route
+	leaf.closeConnection(SlowConsumerWriteDeadline)
+	ch <- true
+}
+
+func TestLeafNodeRemoteWrongPort(t *testing.T) {
+	for _, test1 := range []struct {
+		name              string
+		clusterAdvertise  bool
+		leafnodeAdvertise bool
+	}{
+		{"advertise_on", false, false},
+		{"cluster_no_advertise", true, false},
+		{"leafnode_no_advertise", false, true},
+	} {
+		t.Run(test1.name, func(t *testing.T) {
+			oa := DefaultOptions()
+			// Make sure we have all ports (client, route, gateway) and we will try
+			// to create a leafnode to connection to each and make sure we get the error.
+			oa.Cluster.NoAdvertise = test1.clusterAdvertise
+			oa.Cluster.Host = "127.0.0.1"
+			oa.Cluster.Port = -1
+			oa.Gateway.Host = "127.0.0.1"
+			oa.Gateway.Port = -1
+			oa.Gateway.Name = "A"
+			oa.LeafNode.Host = "127.0.0.1"
+			oa.LeafNode.Port = -1
+			oa.LeafNode.NoAdvertise = test1.leafnodeAdvertise
+			oa.Accounts = []*Account{NewAccount("sys")}
+			oa.SystemAccount = "sys"
+			sa := RunServer(oa)
+			defer sa.Shutdown()
+
+			ob := DefaultOptions()
+			ob.Cluster.NoAdvertise = test1.clusterAdvertise
+			ob.Cluster.Host = "127.0.0.1"
+			ob.Cluster.Port = -1
+			ob.Routes = RoutesFromStr(fmt.Sprintf("nats://%s:%d", oa.Cluster.Host, oa.Cluster.Port))
+			ob.Gateway.Host = "127.0.0.1"
+			ob.Gateway.Port = -1
+			ob.Gateway.Name = "A"
+			ob.LeafNode.Host = "127.0.0.1"
+			ob.LeafNode.Port = -1
+			ob.LeafNode.NoAdvertise = test1.leafnodeAdvertise
+			ob.Accounts = []*Account{NewAccount("sys")}
+			ob.SystemAccount = "sys"
+			sb := RunServer(ob)
+			defer sb.Shutdown()
+
+			checkClusterFormed(t, sa, sb)
+
+			for _, test := range []struct {
+				name string
+				port int
+			}{
+				{"client", oa.Port},
+				{"cluster", oa.Cluster.Port},
+				{"gateway", oa.Gateway.Port},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					oc := DefaultOptions()
+					// Server with the wrong config against non leafnode port.
+					leafURL, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", test.port))
+					oc.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{leafURL}}}
+					oc.LeafNode.ReconnectInterval = 5 * time.Millisecond
+					sc := RunServer(oc)
+					defer sc.Shutdown()
+					l := &captureErrorLogger{errCh: make(chan string, 10)}
+					sc.SetLogger(l, true, true)
+
+					select {
+					case e := <-l.errCh:
+						if strings.Contains(e, ErrConnectedToWrongPort.Error()) {
+							return
+						}
+					case <-time.After(2 * time.Second):
+						t.Fatalf("Did not get any error about connecting to wrong port for %q - %q",
+							test1.name, test.name)
+					}
+				})
+			}
+		})
+	}
 }

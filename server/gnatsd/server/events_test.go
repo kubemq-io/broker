@@ -347,7 +347,7 @@ func runSolicitWithCredentials(t *testing.T, opts *Options, creds string) (*Serv
 			remotes = [
 				{
 					url: nats-leaf://127.0.0.1:%d
-					credentials: "%s"
+					credentials: '%s'
 				}
 			]
 		}
@@ -360,10 +360,16 @@ func runSolicitWithCredentials(t *testing.T, opts *Options, creds string) (*Serv
 
 // Helper function to check that a leaf node has connected to our server.
 func checkLeafNodeConnected(t *testing.T, s *Server) {
+	checkLeafNodeConnectedCnt(t, s, 1)
+}
+
+// Helper function to check that a leaf node has connected to n server.
+func checkLeafNodeConnectedCnt(t *testing.T, s *Server, lnCons int) {
 	t.Helper()
 	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
-		if nln := s.NumLeafNodes(); nln != 1 {
-			return fmt.Errorf("Expected a connected leafnode for server %q, got none", s.ID())
+		if nln := s.NumLeafNodes(); nln != lnCons {
+			return fmt.Errorf("Expected %d connected leafnode(s) for server %q, got %d",
+				lnCons, s.ID(), nln)
 		}
 		return nil
 	})
@@ -385,7 +391,7 @@ func TestSystemAccountingWithLeafNodes(t *testing.T) {
 
 	acc2, akp2 := createAccount(s)
 
-	// Be explicit to only receive the event for global account.
+	// Be explicit to only receive the event for acc2 account.
 	sub, _ := ncs.SubscribeSync(fmt.Sprintf("$SYS.ACCOUNT.%s.DISCONNECT", acc2.Name))
 	defer sub.Unsubscribe()
 	ncs.Flush()
@@ -408,13 +414,19 @@ func TestSystemAccountingWithLeafNodes(t *testing.T) {
 
 	checkLeafNodeConnected(t, s)
 
+	// Compute the expected number of subs on "sl" based on number
+	// of existing subs before creating the sub on "s".
+	expected := int(sl.NumSubscriptions() + 1)
+
 	nc, err := nats.Connect(url, createUserCreds(t, s, akp2), nats.Name("TEST LEAFNODE EVENTS"))
 	if err != nil {
 		t.Fatalf("Error on connect: %v", err)
 	}
 	defer nc.Close()
-	nc.SubscribeSync("foo")
-	nc.Flush()
+	fooSub := natsSubSync(t, nc, "foo")
+	natsFlush(t, nc)
+
+	checkExpectedSubs(t, expected, sl)
 
 	surl := fmt.Sprintf("nats://%s:%d", slopts.Host, slopts.Port)
 	nc2, err := nats.Connect(surl, nats.Name("TEST LEAFNODE EVENTS"))
@@ -423,15 +435,21 @@ func TestSystemAccountingWithLeafNodes(t *testing.T) {
 	}
 	defer nc2.Close()
 
+	// Compute the expected number of subs on "s" based on number
+	// of existing subs before creating the sub on "sl".
+	expected = int(s.NumSubscriptions() + 1)
+
 	m := []byte("HELLO WORLD")
 
 	// Now generate some traffic
-	nc2.SubscribeSync("*")
+	starSub := natsSubSync(t, nc2, "*")
 	for i := 0; i < 10; i++ {
 		nc2.Publish("foo", m)
 		nc2.Publish("bar", m)
 	}
-	nc2.Flush()
+	natsFlush(t, nc2)
+
+	checkExpectedSubs(t, expected, s)
 
 	// Now send some from the cluster side too.
 	for i := 0; i < 10; i++ {
@@ -439,6 +457,18 @@ func TestSystemAccountingWithLeafNodes(t *testing.T) {
 		nc.Publish("bar", m)
 	}
 	nc.Flush()
+
+	// Make sure all messages are received
+	for i := 0; i < 20; i++ {
+		if _, err := fooSub.NextMsg(time.Second); err != nil {
+			t.Fatalf("Did not get message: %v", err)
+		}
+	}
+	for i := 0; i < 40; i++ {
+		if _, err := starSub.NextMsg(time.Second); err != nil {
+			t.Fatalf("Did not get message: %v", err)
+		}
+	}
 
 	// Now shutdown the leafnode server since this is where the event tracking should
 	// happen. Right now we do not track local clients to the leafnode server that
@@ -462,10 +492,10 @@ func TestSystemAccountingWithLeafNodes(t *testing.T) {
 		t.Fatalf("Expected 110 bytes sent, got %d", dem.Sent.Bytes)
 	}
 	if dem.Received.Msgs != 20 {
-		t.Fatalf("Expected 20 msgs received, got %d", dem.Sent.Msgs)
+		t.Fatalf("Expected 20 msgs received, got %d", dem.Received.Msgs)
 	}
 	if dem.Received.Bytes != 220 {
-		t.Fatalf("Expected 220 bytes sent, got %d", dem.Sent.Bytes)
+		t.Fatalf("Expected 220 bytes sent, got %d", dem.Received.Bytes)
 	}
 }
 
@@ -789,6 +819,11 @@ func TestSystemAccountSystemConnectionLimitsHonored(t *testing.T) {
 		}
 		defer ncb1.Close()
 		tc++
+
+		// The account's connection count is exchanged between servers
+		// so that the local count on each server reflects the total count.
+		// Pause a bit to give a chance to each server to process the update.
+		time.Sleep(15 * time.Millisecond)
 	}
 	if tc != 10 {
 		t.Fatalf("Expected to get 10 external connections, got %d", tc)
@@ -874,14 +909,16 @@ func TestSystemAccountConnectionLimitsServerShutdownGraceful(t *testing.T) {
 	urlB := fmt.Sprintf("nats://%s:%d", optsB.Host, optsB.Port)
 
 	for i := 0; i < 5; i++ {
-		_, err := nats.Connect(urlA, nats.NoReconnect(), createUserCreds(t, sa, akp))
+		nc, err := nats.Connect(urlA, nats.NoReconnect(), createUserCreds(t, sa, akp))
 		if err != nil {
 			t.Fatalf("Expected to connect, got %v", err)
 		}
-		_, err = nats.Connect(urlB, nats.NoReconnect(), createUserCreds(t, sb, akp))
+		defer nc.Close()
+		nc, err = nats.Connect(urlB, nats.NoReconnect(), createUserCreds(t, sb, akp))
 		if err != nil {
 			t.Fatalf("Expected to connect, got %v", err)
 		}
+		defer nc.Close()
 	}
 
 	// We are at capacity so both of these should fail.
@@ -897,10 +934,11 @@ func TestSystemAccountConnectionLimitsServerShutdownGraceful(t *testing.T) {
 
 	// Now we should be able to create more on A now.
 	for i := 0; i < 5; i++ {
-		_, err := nats.Connect(urlA, createUserCreds(t, sa, akp))
+		nc, err := nats.Connect(urlA, createUserCreds(t, sa, akp))
 		if err != nil {
 			t.Fatalf("Expected to connect on %d, got %v", i, err)
 		}
+		defer nc.Close()
 	}
 }
 
@@ -1093,9 +1131,7 @@ func TestAccountConnsLimitExceededAfterUpdate(t *testing.T) {
 		t.Fatalf("Expected max connections to be set to 2, got %d", acc.MaxActiveConnections())
 	}
 	// We should have closed the excess connections.
-	if total := s.NumClients(); total != acc.MaxActiveConnections() {
-		t.Fatalf("Expected %d connections, got %d", acc.MaxActiveConnections(), total)
-	}
+	checkClientsCount(t, s, acc.MaxActiveConnections())
 }
 
 func TestAccountConnsLimitExceededAfterUpdateDisconnectNewOnly(t *testing.T) {
@@ -1131,9 +1167,7 @@ func TestAccountConnsLimitExceededAfterUpdateDisconnectNewOnly(t *testing.T) {
 	}
 
 	// We should have max here.
-	if total := s.NumClients(); total != acc.MaxActiveConnections() {
-		t.Fatalf("Expected %d connections, got %d", acc.MaxActiveConnections(), total)
-	}
+	checkClientsCount(t, s, acc.MaxActiveConnections())
 
 	// Now change limits to make current connections over the limit.
 	nac = jwt.NewAccountClaims(pub)
@@ -1145,9 +1179,7 @@ func TestAccountConnsLimitExceededAfterUpdateDisconnectNewOnly(t *testing.T) {
 		t.Fatalf("Expected max connections to be set to 2, got %d", acc.MaxActiveConnections())
 	}
 	// We should have closed the excess connections.
-	if total := s.NumClients(); total != acc.MaxActiveConnections() {
-		t.Fatalf("Expected %d connections, got %d", acc.MaxActiveConnections(), total)
-	}
+	checkClientsCount(t, s, acc.MaxActiveConnections())
 
 	// Now make sure that only the new ones were closed.
 	var closed int
@@ -1219,9 +1251,14 @@ func TestSystemAccountWithGateways(t *testing.T) {
 }
 func TestServerEventsStatsZ(t *testing.T) {
 	preStart := time.Now()
+	// Add little bit of delay to make sure that time check
+	// between pre-start and actual start does not fail.
+	time.Sleep(5 * time.Millisecond)
 	sa, optsA, sb, _, akp := runTrustedCluster(t)
 	defer sa.Shutdown()
 	defer sb.Shutdown()
+	// Same between actual start and post start.
+	time.Sleep(5 * time.Millisecond)
 	postStart := time.Now()
 
 	url := fmt.Sprintf("nats://%s:%d", optsA.Host, optsA.Port)
@@ -1404,7 +1441,8 @@ func TestGatewayNameClientInfo(t *testing.T) {
 	defer sa.Shutdown()
 	defer sb.Shutdown()
 
-	_, _, l := newClientForServer(sa)
+	c, _, l := newClientForServer(sa)
+	defer c.close()
 
 	var info Info
 	err := json.Unmarshal([]byte(l[5:]), &info)

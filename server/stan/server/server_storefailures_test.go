@@ -20,10 +20,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/stan"
-	"github.com/kubemq-io/broker/client/stan/pb"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/stores"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 type mockedStore struct {
@@ -41,6 +41,7 @@ type mockedSubStore struct {
 	sync.RWMutex
 	fail          bool
 	failFlushOnce bool
+	ch            chan bool
 }
 
 func (ms *mockedStore) CreateChannel(name string) (*stores.Channel, error) {
@@ -253,7 +254,12 @@ func TestMsgLookupFailures(t *testing.T) {
 func (ss *mockedSubStore) CreateSub(sub *spb.SubState) error {
 	ss.RLock()
 	fail := ss.fail
+	ch := ss.ch
 	ss.RUnlock()
+	if ch != nil {
+		// Wait for notification that we can continue
+		<-ch
+	}
 	if fail {
 		return fmt.Errorf("On purpose")
 	}
@@ -338,6 +344,9 @@ func TestDeleteSubFailures(t *testing.T) {
 	// Produce a message to this durable queue sub
 	if err := sc.Publish("foo", []byte("hello")); err != nil {
 		t.Fatalf("Error on publish: %v", err)
+	}
+	if err := Wait(ch); err != nil {
+		t.Fatal("Did not get our message")
 	}
 	// Create 2 more durable queue subs
 	dqsub2, err := sc.QueueSubscribe("foo", "dqueue", func(_ *stan.Msg) {},

@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/kubemq-io/broker/server/gnatsd/logger"
 )
@@ -189,7 +190,7 @@ func TestNoPasswordsFromConnectTrace(t *testing.T) {
 	opts.Trace = true
 	opts.Username = "derek"
 	opts.Password = "s3cr3t"
-
+	opts.PingInterval = 2 * time.Minute
 	s := &Server{opts: opts}
 	dl := &DummyLogger{}
 	s.SetLogger(dl, false, true)
@@ -201,6 +202,7 @@ func TestNoPasswordsFromConnectTrace(t *testing.T) {
 	defer s.SetLogger(nil, false, false)
 
 	c, _, _ := newClientForServer(s)
+	defer c.close()
 
 	connectOp := []byte("CONNECT {\"user\":\"derek\",\"pass\":\"s3cr3t\"}\r\n")
 	err := c.parse(connectOp)

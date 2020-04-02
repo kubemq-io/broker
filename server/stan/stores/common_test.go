@@ -24,11 +24,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/stan/pb"
-	"github.com/kubemq-io/broker/nuid"
 	"github.com/kubemq-io/broker/server/stan/logger"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/test"
+	"github.com/kubemq-io/broker/nuid"
+	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 var testDefaultStoreLimits = StoreLimits{
@@ -100,6 +100,8 @@ func stackFatalf(t tLogger, f string, args ...interface{}) {
 	}
 
 	t.Fatalf("%s", strings.Join(lines, "\n"))
+	// For staticcheck SA0511...
+	panic("unreachable code")
 }
 
 func msgStoreLookup(t tLogger, ms MsgStore, seq uint64) *pb.MsgProto {

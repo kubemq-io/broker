@@ -24,8 +24,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/server/gnatsd/server"
 	"github.com/nats-io/jwt"
+	"github.com/kubemq-io/broker/server/gnatsd/server"
 	"github.com/kubemq-io/broker/client/nats"
 	"github.com/nats-io/nkeys"
 )
@@ -549,6 +549,7 @@ func TestServiceLatencyWithQueueSubscribersAndNames(t *testing.T) {
 	// Create 10 queue subscribers for the service. Randomly select the server.
 	for i := 0; i < numResponders; i++ {
 		nc := clientConnectWithName(t, selectServer(), "foo", sname(i))
+		defer nc.Close()
 		nc.QueueSubscribe("ngs.usage.*", "SERVICE", func(msg *nats.Msg) {
 			time.Sleep(time.Duration(rand.Int63n(10)) * time.Millisecond)
 			msg.Respond([]byte("22 msgs"))
@@ -558,6 +559,7 @@ func TestServiceLatencyWithQueueSubscribersAndNames(t *testing.T) {
 
 	doRequest := func() {
 		nc := clientConnect(t, selectServer(), "bar")
+		defer nc.Close()
 		if _, err := nc.Request("ngs.usage", []byte("1h"), time.Second); err != nil {
 			t.Fatalf("Failed to get request response: %v", err)
 		}

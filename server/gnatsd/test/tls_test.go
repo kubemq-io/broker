@@ -743,7 +743,10 @@ func TestTLSGatewaysCertificateCNBasedAuth(t *testing.T) {
 
 	received := make(chan *nats.Msg)
 	_, err = nc1.Subscribe("foo", func(msg *nats.Msg) {
-		received <- msg
+		select {
+		case received <- msg:
+		default:
+		}
 	})
 	if err != nil {
 		t.Error(err)
@@ -1043,34 +1046,6 @@ func TestTLSTimeoutNotReportSlowConsumer(t *testing.T) {
 	}
 }
 
-func TestNotReportSlowConsumerUnlessConnected(t *testing.T) {
-	oa, err := server.ProcessConfigFile("./configs/srv_a_tls.conf")
-	if err != nil {
-		t.Fatalf("Unable to load config file: %v", err)
-	}
-
-	// Override WriteDeadline to very small value so that handshake
-	// fails with a slow consumer error.
-	oa.WriteDeadline = 1 * time.Nanosecond
-	sa := RunServer(oa)
-	defer sa.Shutdown()
-
-	ch := make(chan string, 1)
-	cscl := &captureSlowConsumerLogger{ch: ch}
-	sa.SetLogger(cscl, false, false)
-
-	nc := createClientConn(t, oa.Host, oa.Port)
-	defer nc.Close()
-
-	// Make sure we don't get any Slow Consumer error.
-	select {
-	case e := <-ch:
-		t.Fatalf("Unexpected slow consumer error: %s", e)
-	case <-time.After(500 * time.Millisecond):
-		// ok
-	}
-}
-
 func TestTLSHandshakeFailureMemUsage(t *testing.T) {
 	for i, test := range []struct {
 		name   string
@@ -1137,6 +1112,7 @@ func TestTLSHandshakeFailureMemUsage(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Error on dial: %v", err)
 				}
+				conn.SetWriteDeadline(time.Now().Add(10 * time.Millisecond))
 				conn.Write(buf)
 				conn.Close()
 			}

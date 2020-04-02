@@ -26,8 +26,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/stan/pb"
 	"github.com/kubemq-io/broker/server/stan/util"
+	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 const (
@@ -1742,6 +1742,40 @@ func TestFSRecoverEmptyIndexMsgFile(t *testing.T) {
 	rm := msgStoreLookup(t, c.Msgs, msg.Sequence)
 	if !reflect.DeepEqual(rm, msg) {
 		t.Fatalf("Expected %v, got %v", msg, rm)
+	}
+}
+
+func TestFSEmptyRemovesAllMsgsFiles(t *testing.T) {
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
+
+	s := createDefaultFileStore(t)
+	defer s.Close()
+
+	c := storeCreateChannel(t, s, "foo")
+	ms := c.Msgs
+	storeMsg(t, c, "foo", 1, []byte("msg"))
+	ms.(*FileMsgStore).RLock()
+	datname := ms.(*FileMsgStore).writeSlice.file.name
+	idxname := ms.(*FileMsgStore).writeSlice.idxFile.name
+	ms.(*FileMsgStore).RUnlock()
+	s.Close()
+
+	os.Remove(datname)
+
+	s, rs := openDefaultFileStore(t)
+	defer s.Close()
+
+	c = getRecoveredChannel(t, rs, "foo")
+	if n, b := msgStoreState(t, c.Msgs); n != 0 || b != 0 {
+		t.Fatalf("Unexpected state: %v - %v", n, b)
+	}
+	if err := c.Msgs.Empty(); err != nil {
+		t.Fatalf("Error on empty: %v", err)
+	}
+	// Make sure we have remove the index file too.
+	if fi, err := os.Stat(idxname); err == nil || fi != nil {
+		t.Fatalf("Expected index file to be gone, it was not")
 	}
 }
 
