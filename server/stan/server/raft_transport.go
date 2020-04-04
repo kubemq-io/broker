@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hashicorp/go-hclog"
 	"io"
 	"log"
 	"net"
@@ -367,25 +368,36 @@ func newNATSTransport(id string, conn *nats.Conn, timeout time.Duration, logOutp
 	return newNATSTransportWithLogger(id, conn, timeout, log.New(logOutput, "", log.LstdFlags))
 }
 
+type raftTempLogger struct {
+	*log.Logger
+}
+func (l *raftTempLogger) Debug (msg string, args ...interface{}) {
+
+}
 // newNATSTransportWithLogger creates a new raft.NetworkTransport implemented
 // with NATS as the transport layer using the provided Logger.
 func newNATSTransportWithLogger(id string, conn *nats.Conn, timeout time.Duration, logger *log.Logger) (*raft.NetworkTransport, error) {
 	return createNATSTransport(id, conn, logger, timeout, func(stream raft.StreamLayer) *raft.NetworkTransport {
-		return raft.NewNetworkTransportWithLogger(stream, 3, timeout, logger)
+		appLogger := hclog.New(&hclog.LoggerOptions{
+			Name:  "raft-transport",
+			Level: hclog.LevelFromString("DEBUG"),
+		})
+		return raft.NewNetworkTransportWithLogger(stream, 3, timeout, appLogger)
 	})
 }
-
-// newNATSTransportWithConfig returns a raft.NetworkTransport implemented
-// with NATS as the transport layer, using the given config struct.
-func newNATSTransportWithConfig(id string, conn *nats.Conn, config *raft.NetworkTransportConfig) (*raft.NetworkTransport, error) {
-	if config.Timeout == 0 {
-		config.Timeout = defaultTPortTimeout
-	}
-	return createNATSTransport(id, conn, config.Logger, config.Timeout, func(stream raft.StreamLayer) *raft.NetworkTransport {
-		config.Stream = stream
-		return raft.NewNetworkTransportWithConfig(config)
-	})
-}
+//
+//// newNATSTransportWithConfig returns a raft.NetworkTransport implemented
+//// with NATS as the transport layer, using the given config struct.
+//func newNATSTransportWithConfig(id string, conn *nats.Conn, config *raft.NetworkTransportConfig) (*raft.NetworkTransport, error) {
+//	if config.Timeout == 0 {
+//		config.Timeout = defaultTPortTimeout
+//	}
+//
+//	return createNATSTransport(id, conn, config.Logger, config.Timeout, func(stream raft.StreamLayer) *raft.NetworkTransport {
+//		config.Stream = stream
+//		return raft.NewNetworkTransportWithConfig(config)
+//	})
+//}
 
 func createNATSTransport(id string, conn *nats.Conn, logger *log.Logger, timeout time.Duration,
 	transportCreator func(stream raft.StreamLayer) *raft.NetworkTransport) (*raft.NetworkTransport, error) {

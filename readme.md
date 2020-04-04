@@ -15,7 +15,7 @@ Date: 05:12/19
 
 ### Release 1.2.0
 
-Date: 02:04/20
+Date: 02/04/20
 
 | Package               | Version |
 |:----------------------|:--------|
@@ -24,6 +24,20 @@ Date: 02:04/20
 | nats.go               | v1.9.2  |
 | stan.go               | v0.6.0  |
 | nuid                  | v1.0.1  |
+
+
+### Release 1.3.0
+update for raft packages
+Date: 04/04/20
+
+| Package               | Version |
+|:----------------------|:--------|
+| nats-server           | v2.1.6  |
+| nats-streaming-server | v0.17.0 |
+| nats.go               | v1.9.2  |
+| stan.go               | v0.6.0  |
+| nuid                  | v1.0.1  |
+
 
 
 
