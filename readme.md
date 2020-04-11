@@ -55,3 +55,15 @@ Date: 04/11/20
 
 
 
+### Release 1.4.1
+Add Pipe files
+Date: 04/11/20
+
+| Package               | Version |
+|:----------------------|:--------|
+| nats-server           | v2.1.6  |
+| nats-streaming-server | v0.17.0 |
+| nats.go               | v1.9.2  |
+| stan.go               | v0.6.0  |
+| nuid                  | v1.0.1  |
+
