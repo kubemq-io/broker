@@ -21,8 +21,8 @@ import (
 	"time"
 
 	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/nuid"
 	"github.com/kubemq-io/broker/client/stan/pb"
+	"github.com/kubemq-io/broker/pkg/nuid"
 )
 
 // Version is the NATS Streaming Go Client version
@@ -200,7 +200,7 @@ func getDefaultOptions() Options {
 // DEPRECATED: Use getDefaultOptions() instead in the library, neither in
 // clients.
 // DefaultOptions is not safe for use by multiple clients.
-// For details see https://github.com/kubemq-io/broker/client/nats/issues/308.
+// For details see https://github.com/kubemq-io/kubemq/broker/broker/client/nats/issues/308.
 // DefaultOptions are the NATS Streaming client's default options
 var DefaultOptions = getDefaultOptions()
 

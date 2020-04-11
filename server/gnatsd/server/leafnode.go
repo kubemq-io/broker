@@ -34,8 +34,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kubemq-io/broker/pkg/nuid"
 	"github.com/nats-io/nkeys"
-	"github.com/kubemq-io/broker/nuid"
 )
 
 // Warning when user configures leafnode TLS insecure

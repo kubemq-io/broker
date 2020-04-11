@@ -27,8 +27,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/server/gnatsd/server"
 	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/server/gnatsd/server"
 )
 
 const CLIENT_PORT = 11422

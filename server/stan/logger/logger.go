@@ -127,7 +127,6 @@ func (s *StanLogger) Fatalf(format string, v ...interface{}) {
 	}, format, v...)
 }
 
-
 // Debugf logs a debug statement
 func (s *StanLogger) Debugf(format string, v ...interface{}) {
 	s.executeLogCall(func(log Logger, format string, v ...interface{}) {

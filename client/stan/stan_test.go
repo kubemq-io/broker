@@ -31,10 +31,10 @@ import (
 	"testing"
 	"time"
 
-	natsd "github.com/kubemq-io/broker/server/gnatsd/test"
-	"github.com/kubemq-io/broker/server/stan/server"
 	"github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/client/stan/pb"
+	natsd "github.com/kubemq-io/broker/server/gnatsd/test"
+	"github.com/kubemq-io/broker/server/stan/server"
 )
 
 func RunServer(ID string) *server.StanServer {

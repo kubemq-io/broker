@@ -24,8 +24,8 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
-	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/server/stan/spb"
 )
 
 const (

@@ -17,10 +17,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kubemq-io/broker/client/stan/pb"
 	"github.com/kubemq-io/broker/server/stan/logger"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/util"
-	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 // format string used to report that limit is reached when storing

@@ -371,9 +371,11 @@ func newNATSTransport(id string, conn *nats.Conn, timeout time.Duration, logOutp
 type raftTempLogger struct {
 	*log.Logger
 }
-func (l *raftTempLogger) Debug (msg string, args ...interface{}) {
+
+func (l *raftTempLogger) Debug(msg string, args ...interface{}) {
 
 }
+
 // newNATSTransportWithLogger creates a new raft.NetworkTransport implemented
 // with NATS as the transport layer using the provided Logger.
 func newNATSTransportWithLogger(id string, conn *nats.Conn, timeout time.Duration, logger *log.Logger) (*raft.NetworkTransport, error) {
@@ -385,6 +387,7 @@ func newNATSTransportWithLogger(id string, conn *nats.Conn, timeout time.Duratio
 		return raft.NewNetworkTransportWithLogger(stream, 3, timeout, appLogger)
 	})
 }
+
 //
 //// newNATSTransportWithConfig returns a raft.NetworkTransport implemented
 //// with NATS as the transport layer, using the given config struct.

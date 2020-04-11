@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/jwt"
 	"github.com/kubemq-io/broker/client/nats"
+	"github.com/nats-io/jwt"
 	"github.com/nats-io/nkeys"
 )
 

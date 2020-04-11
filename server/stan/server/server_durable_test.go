@@ -19,10 +19,9 @@ import (
 	"testing"
 	"time"
 
-	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
-	"github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/client/stan/pb"
+	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
 )
 
 func TestDurableRestartWithMaxInflight(t *testing.T) {

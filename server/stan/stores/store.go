@@ -17,8 +17,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/client/stan/pb"
+	"github.com/kubemq-io/broker/server/stan/spb"
 )
 
 const (

@@ -37,10 +37,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/nats-io/jwt"
 	"github.com/kubemq-io/broker/client/nats/util"
+	"github.com/kubemq-io/broker/pkg/nuid"
+	"github.com/nats-io/jwt"
 	"github.com/nats-io/nkeys"
-	"github.com/kubemq-io/broker/nuid"
 )
 
 // Default Constants

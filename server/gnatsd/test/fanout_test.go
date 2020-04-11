@@ -20,8 +20,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/kubemq-io/broker/server/gnatsd/server"
 	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/server/gnatsd/server"
 )
 
 // IMPORTANT: Tests in this file are not executed when running with the -race flag.

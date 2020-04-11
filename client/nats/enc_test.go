@@ -18,7 +18,6 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/client/nats/encoders/protobuf"
 	"github.com/kubemq-io/broker/client/nats/encoders/protobuf/testdata"
 )

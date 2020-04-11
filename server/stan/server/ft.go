@@ -18,10 +18,10 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/stores"
 	"github.com/kubemq-io/broker/server/stan/util"
-	"github.com/kubemq-io/broker/client/nats"
 )
 
 // FT constants

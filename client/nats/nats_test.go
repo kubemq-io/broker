@@ -36,9 +36,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/jwt"
 	"github.com/kubemq-io/broker/server/gnatsd/server"
 	natsserver "github.com/kubemq-io/broker/server/gnatsd/test"
+	"github.com/nats-io/jwt"
 	"github.com/nats-io/nkeys"
 )
 

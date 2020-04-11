@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/client/stan/pb"
 )
 

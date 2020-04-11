@@ -26,12 +26,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kubemq-io/broker/client/nats"
 	natsd "github.com/kubemq-io/broker/server/gnatsd/server"
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/stores"
-	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/nats"
 )
 
 func TestRunServer(t *testing.T) {

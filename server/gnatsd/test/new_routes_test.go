@@ -20,9 +20,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/server/gnatsd/logger"
 	"github.com/kubemq-io/broker/server/gnatsd/server"
-	"github.com/kubemq-io/broker/client/nats"
 )
 
 func runNewRouteServer(t *testing.T) (*server.Server, *server.Options) {

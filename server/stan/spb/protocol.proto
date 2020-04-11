@@ -18,7 +18,7 @@ syntax = "proto3";
 package spb;
 
 import "github.com/gogo/protobuf/gogoproto/gogo.proto";
-import "github.com/kubemq-io/broker/client/stan/pb/protocol.proto";
+import "github.com/kubemq-io/kubemq/broker/broker/client/stan/pb/protocol.proto";
 
 option (gogoproto.marshaler_all) = true;
 option (gogoproto.sizer_all) = true;

@@ -31,12 +31,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/jwt"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/pkg/nuid"
 	"github.com/kubemq-io/broker/server/gnatsd/logger"
 	"github.com/kubemq-io/broker/server/gnatsd/server"
-	"github.com/kubemq-io/broker/client/nats"
+	"github.com/nats-io/jwt"
 	"github.com/nats-io/nkeys"
-	"github.com/kubemq-io/broker/nuid"
 )
 
 func createLeafConn(t tLogger, host string, port int) net.Conn {

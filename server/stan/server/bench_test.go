@@ -21,7 +21,6 @@ import (
 
 	"github.com/kubemq-io/broker/server/stan/stores"
 	"github.com/kubemq-io/broker/server/stan/test"
-	"github.com/kubemq-io/broker/client/nats"
 )
 
 func benchCleanupDatastore(b *testing.B, dir string) {

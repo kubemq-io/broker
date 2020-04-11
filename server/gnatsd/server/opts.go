@@ -32,8 +32,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/nats-io/jwt"
 	"github.com/kubemq-io/broker/server/gnatsd/conf"
+	"github.com/nats-io/jwt"
 	"github.com/nats-io/nkeys"
 )
 

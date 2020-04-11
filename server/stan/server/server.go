@@ -31,15 +31,15 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/stan/pb"
+	"github.com/kubemq-io/broker/pkg/nuid"
 	natsdLogger "github.com/kubemq-io/broker/server/gnatsd/logger"
 	"github.com/kubemq-io/broker/server/gnatsd/server"
 	"github.com/kubemq-io/broker/server/stan/logger"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/stores"
 	"github.com/kubemq-io/broker/server/stan/util"
-	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/nuid"
-	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 // A single NATS Streaming Server
@@ -965,7 +965,7 @@ func (ss *subStore) updateState(sub *subState) {
 		// keep a reference to it until a member re-joins the group.
 		if sub.ClientID == "" {
 			// There should be only one shadow queue subscriber, but
-			// we found in https://github.com/kubemq-io/broker/server/stan/issues/322
+			// we found in https://github.com/kubemq-io/kubemq/broker/broker/server/stan/issues/322
 			// that some datastore had 2 of those (not sure how this happened except
 			// maybe due to upgrades from much older releases that had bugs?).
 			// So don't panic and use as the shadow the one with the highest LastSent
@@ -1897,6 +1897,7 @@ func (s *StanServer) start(runningState State) error {
 	if err != nil {
 		return err
 	}
+
 	if recoveredState != nil {
 		s.log.Noticef("Recovered %v channel(s)", len(recoveredState.Channels))
 	} else {
@@ -2519,7 +2520,7 @@ func (s *StanServer) recoverOneSub(c *channel, recSub *spb.SubState, pendingAcks
 	// Add the subscription to the corresponding client
 	added := s.clients.addSub(sub.ClientID, sub)
 	if added || sub.IsDurable {
-		// Repair for issue https://github.com/kubemq-io/broker/server/stan/issues/215
+		// Repair for issue https://github.com/kubemq-io/kubemq/broker/broker/server/stan/issues/215
 		// Do not recover a queue durable subscriber that still
 		// has ClientID but for which connection was closed (=>!added)
 		if !added && sub.isQueueDurableSubscriber() && !sub.isShadowQueueDurable() {
@@ -3105,6 +3106,7 @@ func (s *StanServer) checkClientHealth(clientID string) {
 	// If we did not get the reply, increase the number of
 	// failed heartbeats.
 	if err != nil {
+
 		client.fhb++
 		// If we have reached the max number of failures
 		if client.fhb > s.opts.ClientHBFailCount {

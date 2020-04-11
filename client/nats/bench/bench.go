@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/nuid"
+	"github.com/kubemq-io/broker/pkg/nuid"
 )
 
 // A Sample for a particular client

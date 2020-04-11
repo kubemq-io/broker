@@ -23,9 +23,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kubemq-io/broker/client/nats"
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
-	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/nats"
 )
 
 func TestRedelivery(t *testing.T) {

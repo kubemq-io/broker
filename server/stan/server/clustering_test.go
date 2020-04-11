@@ -32,14 +32,13 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/stan/pb"
 	natsd "github.com/kubemq-io/broker/server/gnatsd/server"
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
 	"github.com/kubemq-io/broker/server/stan/stores"
 	"github.com/kubemq-io/broker/server/stan/test"
 	"github.com/kubemq-io/broker/server/stan/util"
-	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 var defaultRaftLog string

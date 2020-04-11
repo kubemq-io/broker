@@ -15,20 +15,19 @@ package server
 
 import (
 	"fmt"
-	"github.com/kubemq-io/broker/nuid"
+	"github.com/kubemq-io/broker/pkg/nuid"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/stan/pb"
 	natsd "github.com/kubemq-io/broker/server/gnatsd/server"
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/stores"
 	"github.com/kubemq-io/broker/server/stan/util"
-	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 func setPartitionsVarsForTest() {

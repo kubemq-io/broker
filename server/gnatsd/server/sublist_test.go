@@ -26,7 +26,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/nuid"
+	"github.com/kubemq-io/broker/pkg/nuid"
 )
 
 // FIXME(dlc) - this is also used by monitor_test. Not needed with t.Helper.
