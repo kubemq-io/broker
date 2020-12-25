@@ -79,3 +79,15 @@ Date: 04/13/20
 | nats.go               | v1.9.2  |
 | stan.go               | v0.6.0  |
 | nuid                  | v1.0.1  |
+
+### Release 1.5.0
+expose raft state
+Date: 04/13/20
+
+| Package               | Version |
+|:----------------------|:--------|
+| nats-server           | v2.1.9  |
+| nats-streaming-server | v0.19.0 |
+| nats.go               | v1.10.0  |
+| stan.go               | v0.7.0  |
+| nuid                  | v1.0.1  |

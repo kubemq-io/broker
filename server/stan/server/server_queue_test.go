@@ -22,10 +22,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/stan/pb"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/stores"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/stan"
+	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 // As of now, it is possible for members of the same group to have different

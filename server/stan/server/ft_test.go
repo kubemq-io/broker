@@ -24,10 +24,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/nats"
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/stores"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/stan"
 )
 
 // A mock store that we use to override GetExclusiveLock() behavior.
@@ -159,7 +160,7 @@ func TestFTBasic(t *testing.T) {
 
 	// Configure first server
 	s1sOpts := getTestFTDefaultOptions()
-	s1sOpts.NATSServerURL = "nats://localhost:4222"
+	s1sOpts.NATSServerURL = "nats://127.0.0.1:4222"
 	s1, err := RunServerWithOpts(s1sOpts, nil)
 	if err != nil {
 		t.Fatalf("Error starting server: %v", err)
@@ -169,7 +170,7 @@ func TestFTBasic(t *testing.T) {
 
 	// Configure second server
 	s2sOpts := getTestFTDefaultOptions()
-	s2sOpts.NATSServerURL = "nats://localhost:4222"
+	s2sOpts.NATSServerURL = "nats://127.0.0.1:4222"
 	s2, err := RunServerWithOpts(s2sOpts, nil)
 	if err != nil {
 		t.Fatalf("Error starting server: %v", err)
@@ -301,9 +302,9 @@ func TestFTPartition(t *testing.T) {
 		cleanupFTDatastore(t)
 		defer cleanupFTDatastore(t)
 
-		nOpts.Cluster.ListenStr = "nats://localhost:6222"
-		nOpts.RoutesStr = "nats://localhost:6223"
-		natsURL = "nats://localhost:4222"
+		nOpts.Cluster.ListenStr = "nats://127.0.0.1:6222"
+		nOpts.RoutesStr = "nats://127.0.0.1:6223"
+		natsURL = "nats://127.0.0.1:4222"
 
 		// Use a separate NATS server for communication between
 		// processes for the test
@@ -313,13 +314,13 @@ func TestFTPartition(t *testing.T) {
 		defer ipcNATS.Shutdown()
 	} else {
 		nOpts.Port = 4223
-		nOpts.Cluster.ListenStr = "nats://localhost:6223"
-		nOpts.RoutesStr = "nats://localhost:6222"
-		natsURL = "nats://localhost:4223"
+		nOpts.Cluster.ListenStr = "nats://127.0.0.1:6223"
+		nOpts.RoutesStr = "nats://127.0.0.1:6222"
+		natsURL = "nats://127.0.0.1:4223"
 	}
 	// Create NATS client just for synchronization between the
 	// two processes.
-	syncNC, err := nats.Connect("nats://localhost:5222")
+	syncNC, err := nats.Connect("nats://127.0.0.1:5222")
 	if err != nil {
 		t.Fatalf("Error on connect: %v", err)
 	}
@@ -431,9 +432,9 @@ func TestFTPartitionReversed(t *testing.T) {
 		cleanupFTDatastore(t)
 		defer cleanupFTDatastore(t)
 
-		nOpts.Cluster.ListenStr = "nats://localhost:6222"
-		nOpts.RoutesStr = "nats://localhost:6223"
-		natsURL = "nats://localhost:4222"
+		nOpts.Cluster.ListenStr = "nats://127.0.0.1:6222"
+		nOpts.RoutesStr = "nats://127.0.0.1:6223"
+		natsURL = "nats://127.0.0.1:4222"
 
 		// Use a separate NATS server for communication between
 		// processes for the test
@@ -443,13 +444,13 @@ func TestFTPartitionReversed(t *testing.T) {
 		defer ipcNATS.Shutdown()
 	} else {
 		nOpts.Port = 4223
-		nOpts.Cluster.ListenStr = "nats://localhost:6223"
-		nOpts.RoutesStr = "nats://localhost:6222"
-		natsURL = "nats://localhost:4223"
+		nOpts.Cluster.ListenStr = "nats://127.0.0.1:6223"
+		nOpts.RoutesStr = "nats://127.0.0.1:6222"
+		natsURL = "nats://127.0.0.1:4223"
 	}
 	// Create NATS client just for synchronization between the
 	// two processes.
-	syncNC, err := nats.Connect("nats://localhost:5222")
+	syncNC, err := nats.Connect("nats://127.0.0.1:5222")
 	if err != nil {
 		t.Fatalf("Error on connect: %v", err)
 	}
@@ -684,7 +685,7 @@ func TestFTSteppingDown(t *testing.T) {
 
 	// Start first server
 	opts1 := getTestFTDefaultOptions()
-	opts1.NATSServerURL = "nats://localhost:4222"
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
 	s1 := runServerWithOpts(t, opts1, nil)
 	defer s1.Shutdown()
 	ftReleasePause()
@@ -693,7 +694,7 @@ func TestFTSteppingDown(t *testing.T) {
 
 	// Start 2nd server, give it a mock store that says it can get the lock
 	opts2 := getTestFTDefaultOptions()
-	opts2.NATSServerURL = "nats://localhost:4222"
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
 	s2 := runServerWithOpts(t, opts2, nil)
 	defer s2.Shutdown()
 	replaceWithMockedStore(s2, true, nil)
@@ -729,7 +730,7 @@ func TestFTActiveSendsHB(t *testing.T) {
 
 	// Start Streaming server
 	opts := getTestFTDefaultOptions()
-	opts.NATSServerURL = "nats://localhost:4222"
+	opts.NATSServerURL = "nats://127.0.0.1:4222"
 	s := runServerWithOpts(t, opts, nil)
 	defer s.Shutdown()
 	// Wait for it to be active
@@ -802,7 +803,7 @@ func TestFTActiveReceivesInvalidHBMessages(t *testing.T) {
 
 	// Start Streaming server
 	opts := getTestFTDefaultOptions()
-	opts.NATSServerURL = "nats://localhost:4222"
+	opts.NATSServerURL = "nats://127.0.0.1:4222"
 	s := runServerWithOpts(t, opts, nil)
 	defer s.Shutdown()
 	// Wait for it to be active

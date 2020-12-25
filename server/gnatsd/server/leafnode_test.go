@@ -26,7 +26,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/nats"
+	"github.com/nats-io/nats.go"
 )
 
 type captureLeafNodeRandomIPLogger struct {
@@ -751,7 +751,7 @@ func TestLeafNodeLoop(t *testing.T) {
 	oa.LeafNode.Port = 1234
 	ub, _ := url.Parse("nats://127.0.0.1:5678")
 	oa.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{ub}}}
-	oa.LeafNode.loopDelay = 50 * time.Millisecond
+	oa.LeafNode.connDelay = 50 * time.Millisecond
 	sa := RunServer(oa)
 	defer sa.Shutdown()
 
@@ -763,7 +763,7 @@ func TestLeafNodeLoop(t *testing.T) {
 	ob.LeafNode.Port = 5678
 	ua, _ := url.Parse("nats://127.0.0.1:1234")
 	ob.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{ua}}}
-	ob.LeafNode.loopDelay = 50 * time.Millisecond
+	ob.LeafNode.connDelay = 50 * time.Millisecond
 	sb := RunServer(ob)
 	defer sb.Shutdown()
 
@@ -785,69 +785,66 @@ func TestLeafNodeLoop(t *testing.T) {
 }
 
 func TestLeafNodeLoopFromDAG(t *testing.T) {
-	// we want A point to B and B to A.
+	// We want B & C to point to A, A itself does not point to any other server.
 	oa := DefaultOptions()
+	oa.ServerName = "A"
 	oa.LeafNode.ReconnectInterval = 10 * time.Millisecond
 	oa.LeafNode.Port = -1
 	sa := RunServer(oa)
 	defer sa.Shutdown()
 
-	la := &captureErrorLogger{errCh: make(chan string, 10)}
-	sa.SetLogger(la, false, false)
 	ua, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", oa.LeafNode.Port))
 
+	// B will point to A
 	ob := DefaultOptions()
+	ob.ServerName = "B"
 	ob.LeafNode.ReconnectInterval = 10 * time.Millisecond
 	ob.LeafNode.Port = -1
 	ob.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{ua}}}
 	sb := RunServer(ob)
 	defer sb.Shutdown()
 
-	lb := &captureErrorLogger{errCh: make(chan string, 10)}
-	sb.SetLogger(lb, false, false)
 	ub, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", ob.LeafNode.Port))
 
 	checkLeafNodeConnected(t, sa)
 	checkLeafNodeConnected(t, sb)
 
+	// C will point to A and B
 	oc := DefaultOptions()
+	oc.ServerName = "C"
 	oc.LeafNode.ReconnectInterval = 10 * time.Millisecond
 	oc.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{ua}}, {URLs: []*url.URL{ub}}}
+	oc.LeafNode.connDelay = 100 * time.Millisecond // Allow logger to be attached before connecting.
 	sc := RunServer(oc)
-	// logger with channel can only be specified after startup and is thus not used
 
-	// either error channel (for a or b) may get the error, but not both.
-	errCnt := 0
+	lc := &captureErrorLogger{errCh: make(chan string, 10)}
+	sc.SetLogger(lc, false, false)
 
-errorLoop:
-	for {
-		select {
-		case e := <-la.errCh:
-			if !strings.Contains(e, "Loop") {
-				t.Fatalf("Expected error about loop, got %v", e)
-			}
-			errCnt++
-		case e := <-lb.errCh:
-			if !strings.Contains(e, "Loop") {
-				t.Fatalf("Expected error about loop, got %v", e)
-			}
-			errCnt++
-		case <-time.After(2 * time.Second):
-			if errCnt != 1 {
-				t.Fatalf("Did not get any error regarding loop")
-			}
-			break errorLoop
+	// We should get an error.
+	select {
+	case e := <-lc.errCh:
+		if !strings.Contains(e, "Loop") {
+			t.Fatalf("Expected error about loop, got %v", e)
 		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Did not get any error regarding loop")
 	}
 
+	// C should not be connected to anything.
+	checkLeafNodeConnectedCount(t, sc, 0)
+	// A and B are connected to each other.
+	checkLeafNodeConnectedCount(t, sa, 1)
+	checkLeafNodeConnectedCount(t, sb, 1)
+
+	// Shutdown C and restart without the loop.
 	sc.Shutdown()
 	oc.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{ub}}}
 	sc = RunServer(oc)
 	defer sc.Shutdown()
 
-	checkLeafNodeConnected(t, sa)
-	checkLeafNodeConnectedCnt(t, sb, 2)
-	checkLeafNodeConnected(t, sc)
+	checkLeafNodeConnectedCount(t, sa, 1)
+	checkLeafNodeConnectedCount(t, sb, 2)
+	checkLeafNodeConnectedCount(t, sc, 1)
 }
 
 func TestLeafCloseTLSConnection(t *testing.T) {
@@ -1014,4 +1011,488 @@ func TestLeafNodeRemoteWrongPort(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLeafNodeRemoteIsHub(t *testing.T) {
+	oa := testDefaultOptionsForGateway("A")
+	oa.Accounts = []*Account{NewAccount("sys")}
+	oa.SystemAccount = "sys"
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+
+	lno := DefaultOptions()
+	lno.LeafNode.Host = "127.0.0.1"
+	lno.LeafNode.Port = -1
+	ln := RunServer(lno)
+	defer ln.Shutdown()
+
+	ob1 := testGatewayOptionsFromToWithServers(t, "B", "A", sa)
+	ob1.Accounts = []*Account{NewAccount("sys")}
+	ob1.SystemAccount = "sys"
+	ob1.Cluster.Host = "127.0.0.1"
+	ob1.Cluster.Port = -1
+	ob1.LeafNode.Host = "127.0.0.1"
+	ob1.LeafNode.Port = -1
+	u, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", lno.LeafNode.Port))
+	ob1.LeafNode.Remotes = []*RemoteLeafOpts{
+		&RemoteLeafOpts{
+			URLs: []*url.URL{u},
+			Hub:  true,
+		},
+	}
+	sb1 := RunServer(ob1)
+	defer sb1.Shutdown()
+
+	waitForOutboundGateways(t, sb1, 1, 2*time.Second)
+	waitForInboundGateways(t, sb1, 1, 2*time.Second)
+	waitForOutboundGateways(t, sa, 1, 2*time.Second)
+	waitForInboundGateways(t, sa, 1, 2*time.Second)
+
+	checkLeafNodeConnected(t, sb1)
+
+	// For now, due to issue 977, let's restart the leafnode so that the
+	// leafnode connect is propagated in the super-cluster.
+	ln.Shutdown()
+	ln = RunServer(lno)
+	defer ln.Shutdown()
+	checkLeafNodeConnected(t, sb1)
+
+	// Connect another server in cluster B
+	ob2 := testGatewayOptionsFromToWithServers(t, "B", "A", sa)
+	ob2.Accounts = []*Account{NewAccount("sys")}
+	ob2.SystemAccount = "sys"
+	ob2.Cluster.Host = "127.0.0.1"
+	ob2.Cluster.Port = -1
+	ob2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", ob1.Cluster.Port))
+	sb2 := RunServer(ob2)
+	defer sb2.Shutdown()
+
+	checkClusterFormed(t, sb1, sb2)
+	waitForOutboundGateways(t, sb2, 1, 2*time.Second)
+
+	expectedSubs := ln.NumSubscriptions() + 2
+
+	// Create sub on "foo" connected to sa
+	ncA := natsConnect(t, sa.ClientURL())
+	defer ncA.Close()
+	subFoo := natsSubSync(t, ncA, "foo")
+
+	// Create sub on "bar" connected to sb2
+	ncB2 := natsConnect(t, sb2.ClientURL())
+	defer ncB2.Close()
+	subBar := natsSubSync(t, ncB2, "bar")
+
+	// Make sure subscriptions have propagated to the leafnode.
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		if subs := ln.NumSubscriptions(); subs < expectedSubs {
+			return fmt.Errorf("Number of subs is %d", subs)
+		}
+		return nil
+	})
+
+	// Create pub connection on leafnode
+	ncLN := natsConnect(t, ln.ClientURL())
+	defer ncLN.Close()
+
+	// Publish on foo and make sure it is received.
+	natsPub(t, ncLN, "foo", []byte("msg"))
+	natsNexMsg(t, subFoo, time.Second)
+
+	// Publish on foo and make sure it is received.
+	natsPub(t, ncLN, "bar", []byte("msg"))
+	natsNexMsg(t, subBar, time.Second)
+}
+
+func TestLeafNodePermissions(t *testing.T) {
+	lo1 := DefaultOptions()
+	lo1.LeafNode.Host = "127.0.0.1"
+	lo1.LeafNode.Port = -1
+	ln1 := RunServer(lo1)
+	defer ln1.Shutdown()
+
+	errLog := &captureErrorLogger{errCh: make(chan string, 1)}
+	ln1.SetLogger(errLog, false, false)
+
+	u, _ := url.Parse(fmt.Sprintf("nats://%s:%d", lo1.LeafNode.Host, lo1.LeafNode.Port))
+	lo2 := DefaultOptions()
+	lo2.LeafNode.ReconnectInterval = 5 * time.Millisecond
+	lo2.LeafNode.connDelay = 100 * time.Millisecond
+	lo2.LeafNode.Remotes = []*RemoteLeafOpts{
+		{
+			URLs:        []*url.URL{u},
+			DenyExports: []string{"export.*", "export"},
+			DenyImports: []string{"import.*", "import"},
+		},
+	}
+	ln2 := RunServer(lo2)
+	defer ln2.Shutdown()
+
+	checkLeafNodeConnected(t, ln1)
+
+	// Create clients on ln1 and ln2
+	nc1, err := nats.Connect(ln1.ClientURL())
+	if err != nil {
+		t.Fatalf("Error creating client: %v", err)
+	}
+	defer nc1.Close()
+	nc2, err := nats.Connect(ln2.ClientURL())
+	if err != nil {
+		t.Fatalf("Error creating client: %v", err)
+	}
+	defer nc2.Close()
+
+	checkSubs := func(acc *Account, expected int) {
+		t.Helper()
+		checkFor(t, time.Second, 15*time.Millisecond, func() error {
+			if n := acc.TotalSubs(); n != expected {
+				return fmt.Errorf("Expected %d subs, got %v", expected, n)
+			}
+			return nil
+		})
+	}
+
+	// Create a sub on ">" on LN1
+	subAll := natsSubSync(t, nc1, ">")
+	// this should be registered in LN2 (there is 1 sub for LN1 $LDS subject)
+	checkSubs(ln2.globalAccount(), 2)
+
+	// Check deny export clause from messages published from LN2
+	for _, test := range []struct {
+		name     string
+		subject  string
+		received bool
+	}{
+		{"do not send on export.bat", "export.bat", false},
+		{"do not send on export", "export", false},
+		{"send on foo", "foo", true},
+		{"send on export.this.one", "export.this.one", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			nc2.Publish(test.subject, []byte("msg"))
+			if test.received {
+				natsNexMsg(t, subAll, time.Second)
+			} else {
+				if _, err := subAll.NextMsg(50 * time.Millisecond); err == nil {
+					t.Fatalf("Should not have received message on %q", test.subject)
+				}
+			}
+		})
+	}
+
+	subAll.Unsubscribe()
+	// Goes down to 1 (the $LDS one)
+	checkSubs(ln2.globalAccount(), 1)
+
+	// Check that deny export clause prevents subs from LN1 on matching
+	// subjects in the deny list to be registered on LN2. Furthermore,
+	// LN1 will receive a permission violation and the connection will
+	// be closed.
+	for _, test := range []struct {
+		name    string
+		subject string
+		ok      bool
+	}{
+		{"reject remote sub on export.*", "export.*", false},
+		{"reject remote sub on export", "export", false},
+		{"accepts remote sub on foo", "foo", true},
+		{"accepts remote sub on export.this.one.ok", "export.this.one.ok", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sub := natsSubSync(t, nc1, test.subject)
+			if !test.ok {
+				select {
+				case e := <-errLog.errCh:
+					if !strings.Contains(e, "Permissions Violation for Subscription to") {
+						t.Fatalf("Unexpected error: %q", e)
+					}
+				case <-time.After(time.Second):
+					t.Fatalf("Should have got an error")
+				}
+				sub.Unsubscribe()
+				// Should have disconnected
+				checkLeafNodeConnectedCount(t, ln2, 0)
+				checkSubs(ln2.globalAccount(), 0)
+				// But will reconnect after the connect delay
+				checkLeafNodeConnectedCount(t, ln2, 1)
+			} else {
+				checkSubs(ln2.globalAccount(), 2)
+				nc2.Publish(test.subject, []byte("msg"))
+				natsNexMsg(t, sub, time.Second)
+				sub.Unsubscribe()
+				checkSubs(ln2.globalAccount(), 1)
+			}
+		})
+	}
+
+	// Now check deny import clause.
+	// As of now, we don't suppress forwarding of subscriptions on LN2 that
+	// match the deny import clause to be forwarded to LN1. However, messages
+	// should still not be able to come back to LN2.
+	for _, test := range []struct {
+		name       string
+		subSubject string
+		pubSubject string
+		ok         bool
+	}{
+		{"reject import on import.*", "import.*", "import.bad", false},
+		{"reject import on import", "import", "import", false},
+		{"accepts import on foo", "foo", "foo", true},
+		{"accepts import on import.this.one.ok", "import.*.>", "import.this.one.ok", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sub := natsSubSync(t, nc2, test.subSubject)
+			checkSubs(ln1.globalAccount(), 2)
+			nc1.Publish(test.pubSubject, []byte("msg"))
+			if !test.ok {
+				select {
+				case e := <-errLog.errCh:
+					if !strings.Contains(e, "Permissions Violation for Publish to") {
+						t.Fatalf("Unexpected error: %q", e)
+					}
+				case <-time.After(time.Second):
+					t.Fatalf("Should have got an error")
+				}
+				sub.Unsubscribe()
+				// Should have disconnected
+				checkLeafNodeConnectedCount(t, ln2, 0)
+				checkSubs(ln1.globalAccount(), 0)
+				// But will reconnect after the connect delay
+				checkLeafNodeConnectedCount(t, ln2, 1)
+			} else {
+				natsNexMsg(t, sub, time.Second)
+				sub.Unsubscribe()
+				checkSubs(ln1.globalAccount(), 1)
+			}
+		})
+	}
+}
+
+func TestLeafNodeExportPermissionsNotForSpecialSubs(t *testing.T) {
+	lo1 := DefaultOptions()
+	lo1.Accounts = []*Account{NewAccount("SYS")}
+	lo1.SystemAccount = "SYS"
+	lo1.Gateway.Name = "A"
+	lo1.Gateway.Port = -1
+	lo1.LeafNode.Host = "127.0.0.1"
+	lo1.LeafNode.Port = -1
+	ln1 := RunServer(lo1)
+	defer ln1.Shutdown()
+
+	u, _ := url.Parse(fmt.Sprintf("nats://%s:%d", lo1.LeafNode.Host, lo1.LeafNode.Port))
+	lo2 := DefaultOptions()
+	lo2.LeafNode.Remotes = []*RemoteLeafOpts{
+		{
+			URLs:        []*url.URL{u},
+			DenyExports: []string{">"},
+		},
+	}
+	ln2 := RunServer(lo2)
+	defer ln2.Shutdown()
+
+	checkLeafNodeConnected(t, ln1)
+
+	// The deny is totally restrictive, but make sure that we still accept the $LDS, $GR and _GR_ go from LN1.
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		// We should have registered the 3 subs from the accepting leafnode.
+		if n := ln2.globalAccount().TotalSubs(); n != 3 {
+			return fmt.Errorf("Expected %d subs, got %v", 3, n)
+		}
+		return nil
+	})
+}
+
+// Make sure that if the node that detects the loop (and sends the error and
+// close the connection) is the accept side, the remote node (the one that solicits)
+// properly use the reconnect delay.
+func TestLeafNodeLoopDetectedOnAcceptSide(t *testing.T) {
+	bo := DefaultOptions()
+	bo.LeafNode.Host = "127.0.0.1"
+	bo.LeafNode.Port = -1
+	b := RunServer(bo)
+	defer b.Shutdown()
+
+	l := &captureErrorLogger{errCh: make(chan string, 10)}
+	b.SetLogger(l, false, false)
+
+	u, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", bo.LeafNode.Port))
+
+	ao := testDefaultOptionsForGateway("A")
+	ao.Accounts = []*Account{NewAccount("SYS")}
+	ao.SystemAccount = "SYS"
+	ao.LeafNode.ReconnectInterval = 5 * time.Millisecond
+	ao.LeafNode.Remotes = []*RemoteLeafOpts{
+		{
+			URLs: []*url.URL{u},
+			Hub:  true,
+		},
+	}
+	a := RunServer(ao)
+	defer a.Shutdown()
+
+	co := testGatewayOptionsFromToWithServers(t, "C", "A", a)
+	co.Accounts = []*Account{NewAccount("SYS")}
+	co.SystemAccount = "SYS"
+	co.LeafNode.ReconnectInterval = 5 * time.Millisecond
+	co.LeafNode.Remotes = []*RemoteLeafOpts{
+		{
+			URLs: []*url.URL{u},
+			Hub:  true,
+		},
+	}
+	c := RunServer(co)
+	defer c.Shutdown()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case e := <-l.errCh:
+			if !strings.Contains(e, "Loop detected") {
+				t.Fatalf("Unexpected error: %q", e)
+			}
+		case <-time.After(200 * time.Millisecond):
+			// We are likely to detect from each A and C servers,
+			// but consider a failure if we did not receive any.
+			if i == 0 {
+				t.Fatalf("Should have detected loop")
+			}
+		}
+	}
+
+	// The reconnect attempt is set to 5ms, but the default loop delay
+	// is 30 seconds, so we should not get any new error for that long.
+	// Check if we are getting more errors..
+	select {
+	case e := <-l.errCh:
+		t.Fatalf("Should not have gotten another error, got %q", e)
+	case <-time.After(50 * time.Millisecond):
+		// OK!
+	}
+}
+
+func TestLeafNodeHubWithGateways(t *testing.T) {
+	ao := DefaultOptions()
+	ao.ServerName = "A"
+	ao.LeafNode.Host = "127.0.0.1"
+	ao.LeafNode.Port = -1
+	a := RunServer(ao)
+	defer a.Shutdown()
+
+	ua, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", ao.LeafNode.Port))
+
+	bo := testDefaultOptionsForGateway("B")
+	bo.ServerName = "B"
+	bo.Accounts = []*Account{NewAccount("SYS")}
+	bo.SystemAccount = "SYS"
+	bo.LeafNode.ReconnectInterval = 5 * time.Millisecond
+	bo.LeafNode.Remotes = []*RemoteLeafOpts{
+		{
+			URLs: []*url.URL{ua},
+			Hub:  true,
+		},
+	}
+	b := RunServer(bo)
+	defer b.Shutdown()
+
+	do := DefaultOptions()
+	do.ServerName = "D"
+	do.LeafNode.Host = "127.0.0.1"
+	do.LeafNode.Port = -1
+	d := RunServer(do)
+	defer d.Shutdown()
+
+	ud, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", do.LeafNode.Port))
+
+	co := testGatewayOptionsFromToWithServers(t, "C", "B", b)
+	co.ServerName = "C"
+	co.Accounts = []*Account{NewAccount("SYS")}
+	co.SystemAccount = "SYS"
+	co.LeafNode.ReconnectInterval = 5 * time.Millisecond
+	co.LeafNode.Remotes = []*RemoteLeafOpts{
+		{
+			URLs: []*url.URL{ud},
+			Hub:  true,
+		},
+	}
+	c := RunServer(co)
+	defer c.Shutdown()
+
+	waitForInboundGateways(t, b, 1, 2*time.Second)
+	waitForInboundGateways(t, c, 1, 2*time.Second)
+	checkLeafNodeConnected(t, a)
+	checkLeafNodeConnected(t, d)
+
+	// Create a responder on D
+	ncD := natsConnect(t, d.ClientURL())
+	defer ncD.Close()
+
+	ncD.Subscribe("service", func(m *nats.Msg) {
+		m.Respond([]byte("reply"))
+	})
+	ncD.Flush()
+
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		acc := a.globalAccount()
+		if r := acc.sl.Match("service"); r != nil && len(r.psubs) == 1 {
+			return nil
+		}
+		return fmt.Errorf("subscription still not registered")
+	})
+
+	// Create requestor on A and send the request, expect a reply.
+	ncA := natsConnect(t, a.ClientURL())
+	defer ncA.Close()
+	if msg, err := ncA.Request("service", []byte("request"), time.Second); err != nil {
+		t.Fatalf("Failed to get reply: %v", err)
+	} else if string(msg.Data) != "reply" {
+		t.Fatalf("Unexpected reply: %q", msg.Data)
+	}
+}
+
+func TestLeafNodeTmpClients(t *testing.T) {
+	ao := DefaultOptions()
+	ao.LeafNode.Host = "127.0.0.1"
+	ao.LeafNode.Port = -1
+	a := RunServer(ao)
+	defer a.Shutdown()
+
+	c, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", ao.LeafNode.Port))
+	if err != nil {
+		t.Fatalf("Error connecting: %v", err)
+	}
+	defer c.Close()
+	// Read info
+	br := bufio.NewReader(c)
+	br.ReadLine()
+
+	checkTmp := func(expected int) {
+		t.Helper()
+		checkFor(t, time.Second, 15*time.Millisecond, func() error {
+			a.grMu.Lock()
+			l := len(a.grTmpClients)
+			a.grMu.Unlock()
+			if l != expected {
+				return fmt.Errorf("Expected tmp map to have %v entries, got %v", expected, l)
+			}
+			return nil
+		})
+	}
+	checkTmp(1)
+
+	// Close client and wait check that it is removed.
+	c.Close()
+	checkTmp(0)
+
+	// Check with normal leafnode connection that once connected,
+	// the tmp map is also emptied.
+	bo := DefaultOptions()
+	bo.LeafNode.ReconnectInterval = 5 * time.Millisecond
+	u, err := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", ao.LeafNode.Port))
+	if err != nil {
+		t.Fatalf("Error creating url: %v", err)
+	}
+	bo.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
+	b := RunServer(bo)
+	defer a.Shutdown()
+
+	checkLeafNodeConnected(t, b)
+	checkTmp(0)
 }

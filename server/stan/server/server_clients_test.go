@@ -20,8 +20,9 @@ import (
 	"time"
 
 	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/stan/pb"
 	"github.com/kubemq-io/broker/pkg/nuid"
+	"github.com/kubemq-io/broker/client/stan"
+	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 func TestClientIDIsValid(t *testing.T) {

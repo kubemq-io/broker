@@ -31,15 +31,15 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
-	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/stan/pb"
-	"github.com/kubemq-io/broker/pkg/nuid"
 	natsdLogger "github.com/kubemq-io/broker/server/gnatsd/logger"
 	"github.com/kubemq-io/broker/server/gnatsd/server"
 	"github.com/kubemq-io/broker/server/stan/logger"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/stores"
 	"github.com/kubemq-io/broker/server/stan/util"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/pkg/nuid"
+	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 // A single NATS Streaming Server
@@ -47,7 +47,7 @@ import (
 // Server defaults.
 const (
 	// VERSION is the current version for the NATS Streaming server.
-	VERSION = "0.17.0"
+	VERSION = "0.19.0"
 
 	DefaultClusterID      = "test-cluster"
 	DefaultDiscoverPrefix = "_STAN.discover"
@@ -751,11 +751,16 @@ type StanServer struct {
 	subCloseSub *nats.Subscription
 	subUnsubSub *nats.Subscription
 	cliPingSub  *nats.Subscription
+	addNodeSub  *nats.Subscription
+	rmNodeSub   *nats.Subscription
 
 	// For sending responses to client PINGS. Used to be global but would
 	// cause races when running more than 1 server in a program or test.
 	pingResponseOKBytes            []byte
 	pingResponseInvalidClientBytes []byte
+
+	// If using an external server, capture the URL that was given for return in ClientURL().
+	providedServerURL string
 }
 
 type subsSentAndAckReplication struct {
@@ -965,7 +970,7 @@ func (ss *subStore) updateState(sub *subState) {
 		// keep a reference to it until a member re-joins the group.
 		if sub.ClientID == "" {
 			// There should be only one shadow queue subscriber, but
-			// we found in https://github.com/kubemq-io/kubemq/broker/broker/server/stan/issues/322
+			// we found in https://github.com/kubemq-io/broker/server/stan/issues/322
 			// that some datastore had 2 of those (not sure how this happened except
 			// maybe due to upgrades from much older releases that had bugs?).
 			// So don't panic and use as the shadow the one with the highest LastSent
@@ -1317,6 +1322,10 @@ type Options struct {
 	IOSleepTime        int64         // Duration (in micro-seconds) the server waits for more message to fill up a batch.
 	NATSServerURL      string        // URL for external NATS Server to connect to. If empty, NATS Server is embedded.
 	NATSCredentials    string        // Credentials file for connecting to external NATS Server.
+	Username           string        // Username to use if not provided from command line.
+	Password           string        // Password to use if not provided from command line.
+	Token              string        // Authentication token to use if not provided from command line.
+	NKeySeedFile       string        // File name containing NKey private key.
 	ClientHBInterval   time.Duration // Interval at which server sends heartbeat to a client.
 	ClientHBTimeout    time.Duration // How long server waits for a heartbeat response.
 	ClientHBFailCount  int           // Number of failed heartbeats before server closes client connection.
@@ -1442,6 +1451,9 @@ func (s *StanServer) buildServerURLs() ([]string, error) {
 		}
 		// Use net.Join to support IPV6 addresses.
 		hostport = net.JoinHostPort(host, port)
+
+		// Capture for ClientURL()
+		s.providedServerURL = natsURL
 	} else {
 		// We embed the server, so it is local. If host is "any",
 		// use 127.0.0.1 or ::1 for host address (important for
@@ -1487,9 +1499,28 @@ func (s *StanServer) createNatsClientConn(name string) (*nats.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	// From executable, these are provided through the command line `-user ...`,
+	// so they take precedence over streaming's configuration file
 	ncOpts.User = s.natsOpts.Username
+	if ncOpts.User == "" {
+		ncOpts.User = s.opts.Username
+	}
 	ncOpts.Password = s.natsOpts.Password
+	if ncOpts.Password == "" {
+		ncOpts.Password = s.opts.Password
+	}
 	ncOpts.Token = s.natsOpts.Authorization
+	if ncOpts.Token == "" {
+		ncOpts.Token = s.opts.Token
+	}
+
+	if s.opts.NKeySeedFile != "" {
+		nkey, err := nats.NkeyOptionFromSeed(s.opts.NKeySeedFile)
+		if err != nil {
+			return nil, err
+		}
+		nkey(&ncOpts)
+	}
 
 	ncOpts.Name = fmt.Sprintf("_NSS-%s-%s", s.opts.ID, name)
 
@@ -1683,14 +1714,17 @@ func RunServerWithOpts(stanOpts *Options, natsOpts *server.Options) (newServer *
 		// We used to issue panic for common errors but now return error
 		// instead. Still we want to log the reason for the panic.
 		if r := recover(); r != nil {
-			s.Shutdown()
 			s.log.Noticef("Failed to start: %v", r)
+			// For tests, we still shutdown server even before panic since
+			// some tests will do a recover().
+			s.Shutdown()
 			panic(r)
 		} else if returnedError != nil {
-			s.Shutdown()
 			// Log it as a fatal error, process will exit (if
 			// running from executable or logger is configured).
 			s.log.Fatalf("Failed to start: %v", returnedError)
+			// For tests, we call shutdown() for proper cleanup.
+			s.Shutdown()
 		}
 	}()
 
@@ -1763,6 +1797,9 @@ func RunServerWithOpts(stanOpts *Options, natsOpts *server.Options) (newServer *
 		if err := s.startNATSServer(); err != nil {
 			return nil, err
 		}
+		if natsOpts != nil && natsOpts.Port == server.RANDOM_PORT {
+			natsOpts.Port = nOpts.Port
+		}
 	}
 	// Check for monitoring
 	if nOpts.HTTPPort != 0 || nOpts.HTTPSPort != 0 {
@@ -1803,6 +1840,19 @@ func RunServerWithOpts(stanOpts *Options, natsOpts *server.Options) (newServer *
 		s.handleSignals()
 	}
 	return &s, nil
+}
+
+// ClientURL returns the basic URL string representation suitable for a client to use to connect
+func (s *StanServer) ClientURL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.providedServerURL != "" {
+		return s.providedServerURL
+	} else if s.natsServer != nil {
+		return s.natsServer.ClientURL()
+	} else {
+		return ""
+	}
 }
 
 // Logging in STAN
@@ -1858,7 +1908,7 @@ func (s *StanServer) configureLogger() {
 		newLogger = natsdLogger.NewStdLogger(nOpts.Logtime, enableDebug, enableTrace, colors, true)
 	}
 
-	s.log.SetLogger(newLogger, nOpts.Logtime, sOpts.Debug, sOpts.Trace, nOpts.LogFile)
+	s.log.SetLoggerWithOpts(newLogger, nOpts, sOpts.Debug, sOpts.Trace)
 }
 
 // This is either running inside RunServerWithOpts() and before any reference
@@ -1897,7 +1947,6 @@ func (s *StanServer) start(runningState State) error {
 	if err != nil {
 		return err
 	}
-
 	if recoveredState != nil {
 		s.log.Noticef("Recovered %v channel(s)", len(recoveredState.Channels))
 	} else {
@@ -2004,6 +2053,19 @@ func (s *StanServer) start(runningState State) error {
 		}
 		s.log.Noticef("Cluster Node ID : %s", s.info.NodeID)
 		s.log.Noticef("Cluster Log Path: %s", s.opts.Clustering.RaftLogPath)
+		if len(s.opts.Clustering.Peers) > 0 {
+			s.log.Noticef("Cluster known peers:")
+			var alert bool
+			for i, peer := range s.opts.Clustering.Peers {
+				if strings.Contains(peer, ",") {
+					alert = true
+				}
+				s.log.Noticef("peer %d: %q", i+1, peer)
+			}
+			if alert {
+				s.log.Warnf("Peer name contains ',' make sure you provided an array of peer names, not a string with commas")
+			}
+		}
 		if err := s.startRaftNode(recoveredState != nil); err != nil {
 			return err
 		}
@@ -2367,9 +2429,7 @@ func (s *StanServer) startNATSServer() error {
 	if s.natsServer == nil {
 		return fmt.Errorf("no NATS Server object returned")
 	}
-	if stanLogger := s.log.GetLogger(); stanLogger != nil {
-		s.natsServer.SetLogger(stanLogger, opts.Debug, opts.Trace)
-	}
+	s.log.SetNATSServer(s.natsServer)
 	// Run server in Go routine.
 	go s.natsServer.Start()
 	// Wait for accept loop(s) to be started
@@ -2520,7 +2580,7 @@ func (s *StanServer) recoverOneSub(c *channel, recSub *spb.SubState, pendingAcks
 	// Add the subscription to the corresponding client
 	added := s.clients.addSub(sub.ClientID, sub)
 	if added || sub.IsDurable {
-		// Repair for issue https://github.com/kubemq-io/kubemq/broker/broker/server/stan/issues/215
+		// Repair for issue https://github.com/kubemq-io/broker/server/stan/issues/215
 		// Do not recover a queue durable subscriber that still
 		// has ClientID but for which connection was closed (=>!added)
 		if !added && sub.isQueueDurableSubscriber() && !sub.isShadowQueueDurable() {
@@ -2713,7 +2773,22 @@ func (s *StanServer) initInternalSubs(createPub bool) error {
 	}
 	// Receive PINGs from clients.
 	s.cliPingSub, err = s.createSub(s.info.Discovery+".pings", s.processClientPings, "client pings")
-	return err
+	if err != nil {
+		return err
+	}
+	if s.isClustered && s.opts.Clustering.AllowAddRemoveNode {
+		// Add cluster node requests
+		s.addNodeSub, err = s.createSub(fmt.Sprintf(addClusterNodeSubj, s.opts.ID), s.processAddNode, "add node")
+		if err != nil {
+			return err
+		}
+		// Remove cluster node requests
+		s.rmNodeSub, err = s.createSub(fmt.Sprintf(removeClusterNodeSubj, s.opts.ID), s.processRemoveNode, "remove node")
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *StanServer) unsubscribeInternalSubs() {
@@ -2748,6 +2823,14 @@ func (s *StanServer) unsubscribeInternalSubs() {
 	if s.snapReqSub != nil {
 		s.snapReqSub.Unsubscribe()
 		s.snapReqSub = nil
+	}
+	if s.addNodeSub != nil {
+		s.addNodeSub.Unsubscribe()
+		s.addNodeSub = nil
+	}
+	if s.rmNodeSub != nil {
+		s.rmNodeSub.Unsubscribe()
+		s.rmNodeSub = nil
 	}
 }
 
@@ -3106,7 +3189,6 @@ func (s *StanServer) checkClientHealth(clientID string) {
 	// If we did not get the reply, increase the number of
 	// failed heartbeats.
 	if err != nil {
-
 		client.fhb++
 		// If we have reached the max number of failures
 		if client.fhb > s.opts.ClientHBFailCount {
@@ -3263,7 +3345,7 @@ func (s *StanServer) processClientPublish(m *nats.Msg) {
 
 	// Check if the client is valid. We do this after the clustered check so
 	// that only the leader performs this check.
-	valid := false
+	var valid bool
 	if s.partitions != nil {
 		// In partitioning mode it is possible that we get there
 		// before the connect request is processed. If so, make sure we wait
@@ -3681,6 +3763,7 @@ func (s *StanServer) getMsgForRedelivery(c *channel, sub *subState, seq uint64) 
 		if err != nil {
 			s.log.Errorf("Error getting message for redelivery subid=%d, seq=%d, err=%v",
 				sub.ID, seq, err)
+			return nil
 		}
 		// Ack it so that it does not reincarnate on restart
 		s.processAck(c, sub, seq, false)
@@ -3956,7 +4039,7 @@ func (s *StanServer) processReplicatedSendAndAck(ssa *spb.SubSentAndAck) {
 // are not sent and subscriber is marked as stalled.
 // Sub lock should be held before calling.
 func (s *StanServer) sendMsgToSub(sub *subState, m *pb.MsgProto, force bool) (bool, bool) {
-	if sub == nil || m == nil || !sub.initialized || (sub.newOnHold && !m.Redelivered) {
+	if sub == nil || m == nil || !sub.initialized || sub.ClientID == "" || (sub.newOnHold && !m.Redelivered) {
 		return false, false
 	}
 

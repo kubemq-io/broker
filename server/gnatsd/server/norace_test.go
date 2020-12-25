@@ -25,8 +25,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/nats"
 	"github.com/nats-io/jwt"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 )
 
@@ -631,6 +631,9 @@ func TestNoRaceRouteCache(t *testing.T) {
 				m.Respond(m.Data)
 			})
 			natsFlush(t, responder)
+
+			checkExpectedSubs(t, 1, sa)
+			checkExpectedSubs(t, 1, sb)
 
 			bURL := fmt.Sprintf("nats://%s:%d", ob.Host, ob.Port)
 			requestor := natsConnect(t, bURL)

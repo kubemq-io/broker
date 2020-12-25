@@ -25,13 +25,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/stan/pb"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/test"
+	"github.com/kubemq-io/broker/client/stan/pb"
 
-	mysql "github.com/go-sql-driver/mysql"                                    // mysql driver
+	mysql "github.com/go-sql-driver/mysql"                          // mysql driver
+	_ "github.com/lib/pq"                                           // postgres driver
 	_ "github.com/kubemq-io/broker/server/stan/stores/pqdeadlines" // wrapper for postgres that gives read/write deadlines
-	_ "github.com/lib/pq"                                                     // postgres driver
 )
 
 // The SourceAdmin is used by the test setup to have access
@@ -2042,7 +2042,7 @@ func TestSQLDeadlines(t *testing.T) {
 	} else {
 		port = 5432
 	}
-	proxy, err := newProxy(fmt.Sprintf("localhost:%d", port))
+	proxy, err := newProxy(fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		t.Fatalf("Error creating proxy: %v", err)
 	}
@@ -2050,7 +2050,7 @@ func TestSQLDeadlines(t *testing.T) {
 
 	pport := proxy.getPort()
 	if testSQLDriver == driverMySQL {
-		source = fmt.Sprintf("nss:password@tcp(localhost:%d)/%s?readTimeout=500ms&writeTimeout=500ms", pport, testDefaultDatabaseName)
+		source = fmt.Sprintf("nss:password@tcp(127.0.0.1:%d)/%s?readTimeout=500ms&writeTimeout=500ms", pport, testDefaultDatabaseName)
 		mysql.SetLogger(&silenceMySQLLogger{})
 	} else {
 		source = fmt.Sprintf("port=%d dbname=%s readTimeout=500ms writeTimeout=500ms sslmode=disable", pport, testDefaultDatabaseName)

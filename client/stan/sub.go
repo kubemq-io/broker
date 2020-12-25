@@ -56,7 +56,7 @@ type Subscription interface {
 	// These functions have been added for expert-users that need to get details
 	// about the low level NATS Subscription used internally to receive messages
 	// for this streaming subscription. They are documented in the Go client
-	// library: https://godoc.org/github.com/kubemq-io/kubemq/broker/broker/client/nats#Subscription.ClearMaxPending
+	// library: https://godoc.org/github.com/nats-io/nats.go#Subscription.ClearMaxPending
 
 	// ClearMaxPending resets the maximums seen so far.
 	ClearMaxPending() error

@@ -26,8 +26,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/stan/pb"
 	"github.com/kubemq-io/broker/server/stan/util"
+	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 const (
@@ -1328,6 +1328,34 @@ func TestFSPanicOnStoreCloseWhileMsgsExpire(t *testing.T) {
 	fs.Close()
 }
 
+func TestFSPanicOnMsgExpireWithClosedDatFile(t *testing.T) {
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
+
+	limits := testDefaultStoreLimits
+	limits.MaxAge = 500 * time.Millisecond
+
+	fs, _ := newFileStore(t, testFSDefaultDatastore, &limits, SliceConfig(1, 0, 0, ""))
+	defer fs.Close()
+
+	cs := storeCreateChannel(t, fs, "foo")
+	for i := 0; i < 3; i++ {
+		storeMsg(t, cs, "foo", uint64(i+1), []byte("msg"))
+	}
+
+	ms := cs.Msgs.(*FileMsgStore)
+	ms.Lock()
+	idxFileName := ms.files[1].idxFile.name
+	os.Remove(idxFileName)
+	err := ioutil.WriteFile(idxFileName, []byte("xxxxxxx"), 0666)
+	ms.Unlock()
+	if err != nil {
+		t.Fatalf("Error rewriting index file: %v", err)
+	}
+
+	time.Sleep(750 * time.Millisecond)
+}
+
 func TestFSMsgIndexFileWithExtraZeros(t *testing.T) {
 	cleanupFSDatastore(t)
 	defer cleanupFSDatastore(t)
@@ -1742,6 +1770,53 @@ func TestFSRecoverEmptyIndexMsgFile(t *testing.T) {
 	rm := msgStoreLookup(t, c.Msgs, msg.Sequence)
 	if !reflect.DeepEqual(rm, msg) {
 		t.Fatalf("Expected %v, got %v", msg, rm)
+	}
+}
+
+func TestFSEnsureLastMsgAndIndexMatch(t *testing.T) {
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
+
+	s := createDefaultFileStore(t)
+	defer s.Close()
+
+	c := storeCreateChannel(t, s, "foo")
+	storeMsg(t, c, "foo", 1, []byte("msg1"))
+	storeMsg(t, c, "foo", 2, []byte("msg2"))
+	ms := c.Msgs.(*FileMsgStore)
+	ms.RLock()
+	fname := ms.files[1].file.name
+	offset := ms.wOffset
+	ms.RUnlock()
+	storeMsg(t, c, "foo", 3, []byte("msg3"))
+
+	s.Close()
+
+	f, err := os.OpenFile(fname, os.O_RDWR, 0666)
+	if err != nil {
+		t.Fatalf("Error opening file: %v", err)
+	}
+	defer f.Close()
+	if err := f.Truncate(offset); err != nil {
+		t.Fatalf("Error on truncate: %v", err)
+	}
+	f.Close()
+	f, err = os.OpenFile(fname, os.O_RDWR|os.O_APPEND, 0666)
+	if err != nil {
+		t.Fatalf("Error opening file: %v", err)
+	}
+	defer f.Close()
+	m3 := &pb.MsgProto{Sequence: 3, Subject: "foo", Data: []byte("msg3_modified")}
+	if _, _, err := writeRecord(f, nil, recNoType, m3, m3.Size(), crc32.IEEETable); err != nil {
+		t.Fatalf("Error rewriting file: %v", err)
+	}
+	f.Close()
+
+	s, rs := openDefaultFileStore(t)
+	defer s.Close()
+	c = getRecoveredChannel(t, rs, "foo")
+	if _, err := c.Msgs.Lookup(3); err != nil {
+		t.Fatalf("Error on lookup: %v", err)
 	}
 }
 
@@ -2269,5 +2344,57 @@ func TestFSExpirationError(t *testing.T) {
 	ms.Unlock()
 	if nextExpiration < now+int64(4500*time.Millisecond) {
 		t.Fatalf("Expected next expiration to be set to 5secs from now, got %v", time.Duration(nextExpiration))
+	}
+}
+
+func TestFSMsgsFileVersionError(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		dat    bool
+		suffix string
+	}{
+		{"data", true, datSuffix},
+		{"index", false, idxSuffix},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cleanupFSDatastore(t)
+			defer cleanupFSDatastore(t)
+
+			s := createDefaultFileStore(t)
+			defer s.Close()
+
+			c := storeCreateChannel(t, s, "foo")
+			storeMsg(t, c, "foo", 1, []byte("hello"))
+			if err := c.Msgs.Flush(); err != nil {
+				t.Fatalf("Error flushing store: %v", err)
+			}
+			var fname string
+			ms := c.Msgs.(*FileMsgStore)
+			ms.Lock()
+			if test.dat {
+				fname = ms.files[1].file.name
+			} else {
+				fname = ms.files[1].idxFile.name
+			}
+			ms.Unlock()
+
+			s.Close()
+
+			os.Remove(fname)
+			if err := ioutil.WriteFile(fname, []byte(""), 0666); err != nil {
+				t.Fatalf("Error writing file: %v", err)
+			}
+
+			s, err := NewFileStore(testLogger, testFSDefaultDatastore, nil)
+			if err != nil {
+				t.Fatalf("Error creating filestore: %v", err)
+			}
+			defer s.Close()
+			if _, err := s.Recover(); err == nil ||
+				!strings.Contains(err.Error(), "unable to recover message store for [foo]") ||
+				!strings.Contains(err.Error(), fmt.Sprintf("%s1%s", msgFilesPrefix, test.suffix)) {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+		})
 	}
 }

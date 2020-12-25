@@ -32,8 +32,8 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/kubemq-io/broker/client/nats"
 	"github.com/nats-io/jwt"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 )
 
@@ -43,19 +43,32 @@ const CLUSTER_PORT = -1
 
 func DefaultMonitorOptions() *Options {
 	return &Options{
-		Host:       "127.0.0.1",
-		Port:       CLIENT_PORT,
-		HTTPHost:   "127.0.0.1",
-		HTTPPort:   MONITOR_PORT,
-		ServerName: "monitor_server",
-		NoLog:      true,
-		NoSigs:     true,
+		Host:         "127.0.0.1",
+		Port:         CLIENT_PORT,
+		HTTPHost:     "127.0.0.1",
+		HTTPPort:     MONITOR_PORT,
+		HTTPBasePath: "/",
+		ServerName:   "monitor_server",
+		NoLog:        true,
+		NoSigs:       true,
 	}
 }
 
 func runMonitorServer() *Server {
 	resetPreviousHTTPConnections()
 	opts := DefaultMonitorOptions()
+	return RunServer(opts)
+}
+
+func runMonitorServerWithAccounts() *Server {
+	resetPreviousHTTPConnections()
+	opts := DefaultMonitorOptions()
+	aA := NewAccount("A")
+	aB := NewAccount("B")
+	opts.Accounts = append(opts.Accounts, aA, aB)
+	opts.Users = append(opts.Users,
+		&User{Username: "a", Password: "a", Account: aA},
+		&User{Username: "b", Password: "b", Account: aB})
 	return RunServer(opts)
 }
 
@@ -124,6 +137,7 @@ var (
 	appJSONContent = "application/json"
 	appJSContent   = "application/javascript"
 	textPlain      = "text/plain; charset=utf-8"
+	textHTML       = "text/html; charset=utf-8"
 )
 
 func readBodyEx(t *testing.T, url string, status int, content string) []byte {
@@ -144,6 +158,18 @@ func readBodyEx(t *testing.T, url string, status int, content string) []byte {
 		stackFatalf(t, "Got an error reading the body: %v\n", err)
 	}
 	return body
+}
+
+func TestHTTPBasePath(t *testing.T) {
+	resetPreviousHTTPConnections()
+	opts := DefaultMonitorOptions()
+	opts.HTTPBasePath = "/nats"
+
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/nats", s.MonitorAddr().Port)
+	readBodyEx(t, url, http.StatusOK, textHTML)
 }
 
 func readBody(t *testing.T, url string) []byte {
@@ -1471,6 +1497,93 @@ func TestSubszTestPubSubject(t *testing.T) {
 	readBodyEx(t, testUrl+"test=foo..bar", http.StatusBadRequest, textPlain)
 }
 
+func TestSubszMultiAccount(t *testing.T) {
+	s := runMonitorServerWithAccounts()
+	defer s.Shutdown()
+
+	ncA := createClientConnWithUserSubscribeAndPublish(t, s, "a", "a")
+	defer ncA.Close()
+
+	ncA.Subscribe("foo.*", func(m *nats.Msg) {})
+	ncA.Subscribe("foo.bar", func(m *nats.Msg) {})
+	ncA.Subscribe("foo.foo", func(m *nats.Msg) {})
+
+	ncA.Publish("foo.bar", []byte("Hello"))
+	ncA.Publish("foo.baz", []byte("Hello"))
+	ncA.Publish("foo.foo", []byte("Hello"))
+
+	ncA.Flush()
+
+	ncB := createClientConnWithUserSubscribeAndPublish(t, s, "b", "b")
+	defer ncB.Close()
+
+	ncB.Subscribe("foo.*", func(m *nats.Msg) {})
+	ncB.Subscribe("foo.bar", func(m *nats.Msg) {})
+	ncB.Subscribe("foo.foo", func(m *nats.Msg) {})
+
+	ncB.Publish("foo.bar", []byte("Hello"))
+	ncB.Publish("foo.baz", []byte("Hello"))
+	ncB.Publish("foo.foo", []byte("Hello"))
+
+	ncB.Flush()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+
+	for mode := 0; mode < 2; mode++ {
+		sl := pollSubsz(t, s, mode, url+"subsz?subs=1", &SubszOptions{Subscriptions: true})
+		if sl.NumSubs != 6 {
+			t.Fatalf("Expected NumSubs of 6, got %d\n", sl.NumSubs)
+		}
+		if sl.Total != 6 {
+			t.Fatalf("Expected Total of 6, got %d\n", sl.Total)
+		}
+		if len(sl.Subs) != 6 {
+			t.Fatalf("Expected subscription details for 6 subs, got %d\n", len(sl.Subs))
+		}
+	}
+}
+
+func TestSubszMultiAccountWithOffsetAndLimit(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	ncA := createClientConnWithUserSubscribeAndPublish(t, s, "a", "a")
+	defer ncA.Close()
+
+	for i := 0; i < 200; i++ {
+		ncA.Subscribe(fmt.Sprintf("foo.%d", i), func(m *nats.Msg) {})
+	}
+	ncA.Flush()
+
+	ncB := createClientConnWithUserSubscribeAndPublish(t, s, "b", "b")
+	defer ncB.Close()
+
+	for i := 0; i < 200; i++ {
+		ncB.Subscribe(fmt.Sprintf("foo.%d", i), func(m *nats.Msg) {})
+	}
+	ncB.Flush()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		sl := pollSubsz(t, s, mode, url+"subsz?subs=1&offset=10&limit=100", &SubszOptions{Subscriptions: true, Offset: 10, Limit: 100})
+		if sl.NumSubs != 400 {
+			t.Fatalf("Expected NumSubs of 200, got %d\n", sl.NumSubs)
+		}
+		if sl.Total != 100 {
+			t.Fatalf("Expected Total of 100, got %d\n", sl.Total)
+		}
+		if sl.Offset != 10 {
+			t.Fatalf("Expected Offset of 10, got %d\n", sl.Offset)
+		}
+		if sl.Limit != 100 {
+			t.Fatalf("Expected Total of 100, got %d\n", sl.Limit)
+		}
+		if len(sl.Subs) != 100 {
+			t.Fatalf("Expected subscription details for 100 subs, got %d\n", len(sl.Subs))
+		}
+	}
+}
+
 // Tests handle root
 func TestHandleRoot(t *testing.T) {
 	s := runMonitorServer()
@@ -1735,8 +1848,13 @@ func TestConnzClosedConnsBadTLSClient(t *testing.T) {
 }
 
 // Create a connection to test ConnInfo
-func createClientConnSubscribeAndPublish(t *testing.T, s *Server) *nats.Conn {
-	natsURL := fmt.Sprintf("nats://127.0.0.1:%d", s.Addr().(*net.TCPAddr).Port)
+func createClientConnWithUserSubscribeAndPublish(t *testing.T, s *Server, user, pwd string) *nats.Conn {
+	natsURL := ""
+	if user == "" {
+		natsURL = fmt.Sprintf("nats://127.0.0.1:%d", s.Addr().(*net.TCPAddr).Port)
+	} else {
+		natsURL = fmt.Sprintf("nats://%s:%s@127.0.0.1:%d", user, pwd, s.Addr().(*net.TCPAddr).Port)
+	}
 	client := nats.DefaultOptions
 	client.Servers = []string{natsURL}
 	nc, err := client.Connect()
@@ -1757,6 +1875,10 @@ func createClientConnSubscribeAndPublish(t *testing.T, s *Server) *nats.Conn {
 	close(ch)
 	nc.Flush()
 	return nc
+}
+
+func createClientConnSubscribeAndPublish(t *testing.T, s *Server) *nats.Conn {
+	return createClientConnWithUserSubscribeAndPublish(t, s, "", "")
 }
 
 func createClientConnWithName(t *testing.T, name string, s *Server) *nats.Conn {
@@ -3470,8 +3592,9 @@ func TestMonitorLeafz(t *testing.T) {
 			if ln.RTT == "" {
 				t.Fatalf("RTT not tracked?")
 			}
-			if ln.NumSubs != 0 || len(ln.Subs) != 0 {
-				t.Fatalf("Did not expect sub, got %v (%v)", ln.NumSubs, ln.Subs)
+			// LDS should be only one.
+			if ln.NumSubs != 1 || len(ln.Subs) != 1 {
+				t.Fatalf("Expected 1 sub, got %v (%v)", ln.NumSubs, ln.Subs)
 			}
 		}
 	}

@@ -26,6 +26,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 func checkOptionsEqual(t *testing.T, golden, opts *Options) {
@@ -94,6 +96,7 @@ func TestConfigFile(t *testing.T) {
 		Trace:                 true,
 		Logtime:               false,
 		HTTPPort:              8222,
+		HTTPBasePath:          "/nats",
 		PidFile:               "/tmp/nats-server.pid",
 		ProfPort:              6543,
 		Syslog:                true,
@@ -250,6 +253,7 @@ func TestMergeOverrides(t *testing.T) {
 		Trace:          true,
 		Logtime:        false,
 		HTTPPort:       DEFAULT_HTTP_PORT,
+		HTTPBasePath:   DEFAULT_HTTP_BASE_PATH,
 		PidFile:        "/tmp/nats-server.pid",
 		ProfPort:       6789,
 		Syslog:         true,
@@ -277,11 +281,12 @@ func TestMergeOverrides(t *testing.T) {
 
 	// Overrides via flags
 	opts := &Options{
-		Port:     2222,
-		Password: "porkchop",
-		Debug:    true,
-		HTTPPort: DEFAULT_HTTP_PORT,
-		ProfPort: 6789,
+		Port:         2222,
+		Password:     "porkchop",
+		Debug:        true,
+		HTTPPort:     DEFAULT_HTTP_PORT,
+		HTTPBasePath: DEFAULT_HTTP_BASE_PATH,
+		ProfPort:     6789,
 		Cluster: ClusterOpts{
 			NoAdvertise:    true,
 			ConnectRetries: 2,
@@ -874,6 +879,65 @@ func TestNkeyUsersConfig(t *testing.T) {
 	}
 }
 
+func TestNkeyUsersDefaultPermissionsConfig(t *testing.T) {
+	confFileName := createConfFile(t, []byte(`
+	authorization {
+		default_permissions = {
+			publish = "foo"
+		}
+		users = [
+			{ user: "user", password: "pwd"}
+			{ user: "other", password: "pwd",
+				permissions = {
+					subscribe = "bar"
+				}
+			}
+			{ nkey: "UDKTV7HZVYJFJN64LLMYQBUR6MTNNYCDC3LAZH4VHURW3GZLL3FULBXV" }
+			{ nkey: "UA3C5TBZYK5GJQJRWPMU6NFY5JNAEVQB2V2TUZFZDHFJFUYVKTTUOFKZ",
+				permissions = {
+					subscribe = "bar"
+				}
+			}
+		]
+	}`))
+	checkPerms := func(permsDef *Permissions, permsNonDef *Permissions) {
+		if permsDef.Publish.Allow[0] != "foo" {
+			t.Fatal("Publish allow foo missing")
+		} else if permsDef.Subscribe != nil {
+			t.Fatal("Has unexpected Subscribe permission")
+		} else if permsNonDef.Subscribe.Allow[0] != "bar" {
+			t.Fatal("Subscribe allow bar missing")
+		} else if permsNonDef.Publish != nil {
+			t.Fatal("Has unexpected Publish permission")
+		}
+	}
+	defer os.Remove(confFileName)
+	opts, err := ProcessConfigFile(confFileName)
+	if err != nil {
+		t.Fatalf("Received an error reading config file: %v", err)
+	}
+	if lu := len(opts.Users); lu != 2 {
+		t.Fatalf("Expected 2 nkey users, got %d", lu)
+	}
+	userDefault := opts.Users[0]
+	userNonDef := opts.Users[1]
+	if !strings.HasPrefix(userDefault.Username, "user") {
+		userDefault = opts.Users[1]
+		userNonDef = opts.Users[0]
+	}
+	checkPerms(userDefault.Permissions, userNonDef.Permissions)
+	if lu := len(opts.Nkeys); lu != 2 {
+		t.Fatalf("Expected 2 nkey users, got %d", lu)
+	}
+	nkeyDefault := opts.Nkeys[0]
+	nkeyNonDef := opts.Nkeys[1]
+	if !strings.HasPrefix(nkeyDefault.Nkey, "UDK") {
+		nkeyDefault = opts.Nkeys[1]
+		nkeyNonDef = opts.Nkeys[0]
+	}
+	checkPerms(nkeyDefault.Permissions, nkeyNonDef.Permissions)
+}
+
 func TestNkeyUsersWithPermsConfig(t *testing.T) {
 	confFileName := createConfFile(t, []byte(`
     authorization {
@@ -1049,6 +1113,7 @@ func TestOptionsClone(t *testing.T) {
 		Trace:          true,
 		Logtime:        false,
 		HTTPPort:       DEFAULT_HTTP_PORT,
+		HTTPBasePath:   DEFAULT_HTTP_BASE_PATH,
 		PidFile:        "/tmp/nats-server.pid",
 		ProfPort:       6789,
 		Syslog:         true,
@@ -2459,4 +2524,71 @@ func TestExpandPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNoAuthUserCode(t *testing.T) {
+	confFileName := createConfFile(t, []byte(`
+		listen: "127.0.0.1:-1"
+		no_auth_user: $NO_AUTH_USER
+
+		accounts {
+			synadia {
+				users [
+					{user: "a", password: "a"},
+					{nkey : UBAAQWTW6CG2G6ANGNKB5U2B7HRWHSGMZEZX3AQSAJOQDAUGJD46LD2E},
+				]
+			}
+			acc {
+				users [
+					{user: "c", password: "c"}
+				]
+			}
+		}
+		# config for $G
+		authorization {
+			users [
+				{user: "b", password: "b"}
+			]
+		}
+	`))
+	defer os.Remove(confFileName)
+	defer os.Unsetenv("NO_AUTH_USER")
+
+	for _, user := range []string{"a", "b", "b"} {
+		t.Run(user, func(t *testing.T) {
+			os.Setenv("NO_AUTH_USER", user)
+			opts, err := ProcessConfigFile(confFileName)
+			if err != nil {
+				t.Fatalf("Received unexpected error %s", err)
+			} else {
+				srv := RunServer(opts)
+				nc, err := nats.Connect(fmt.Sprintf("nats://127.0.0.1:%d", opts.Port))
+				if err != nil {
+					t.Fatalf("couldn't connect %s", err)
+				}
+				nc.Close()
+				srv.Shutdown()
+			}
+		})
+	}
+
+	for _, badUser := range []string{"notthere", "UBAAQWTW6CG2G6ANGNKB5U2B7HRWHSGMZEZX3AQSAJOQDAUGJD46LD2E"} {
+		t.Run(badUser, func(t *testing.T) {
+			os.Setenv("NO_AUTH_USER", badUser)
+			opts, err := ProcessConfigFile(confFileName)
+			if err != nil {
+				t.Fatalf("Received unexpected error %s", err)
+			}
+			s, err := NewServer(opts)
+			if err != nil {
+				if !strings.HasPrefix(err.Error(), "no_auth_user") {
+					t.Fatalf("Received unexpected error %s", err)
+				}
+				return // error looks as expected
+			}
+			s.Shutdown()
+			t.Fatalf("Received no error, where no_auth_user error was expected")
+		})
+	}
+
 }

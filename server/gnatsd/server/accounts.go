@@ -50,7 +50,7 @@ type Account struct {
 	sysclients   int32
 	nleafs       int32
 	nrleafs      int32
-	clients      map[*client]*client
+	clients      map[*client]struct{}
 	rm           map[string]int32
 	lqws         map[string]int32
 	usersRevoked map[string]int64
@@ -64,6 +64,7 @@ type Account struct {
 	pruning       bool
 	rmPruning     bool
 	expired       bool
+	incomplete    bool
 	signingKeys   []string
 	srv           *Server // server this account is registered with (possibly nil)
 	lds           string  // loop detection subject for leaf nodes
@@ -198,8 +199,43 @@ func (a *Account) shallowCopy() *Account {
 	na := NewAccount(a.Name)
 	na.Nkey = a.Nkey
 	na.Issuer = a.Issuer
-	na.imports = a.imports
-	na.exports = a.exports
+
+	if a.imports.streams != nil {
+		na.imports.streams = make([]*streamImport, 0, len(a.imports.streams))
+		for _, v := range a.imports.streams {
+			si := *v
+			na.imports.streams = append(na.imports.streams, &si)
+		}
+	}
+	if a.imports.services != nil {
+		na.imports.services = make(map[string]*serviceImport)
+		for k, v := range a.imports.services {
+			si := *v
+			na.imports.services[k] = &si
+		}
+	}
+	if a.exports.streams != nil {
+		na.exports.streams = make(map[string]*streamExport)
+		for k, v := range a.exports.streams {
+			if v != nil {
+				se := *v
+				na.exports.streams[k] = &se
+			} else {
+				na.exports.streams[k] = nil
+			}
+		}
+	}
+	if a.exports.services != nil {
+		na.exports.services = make(map[string]*serviceExport)
+		for k, v := range a.exports.services {
+			if v != nil {
+				se := *v
+				na.exports.services[k] = &se
+			} else {
+				na.exports.services[k] = nil
+			}
+		}
+	}
 	return na
 }
 
@@ -380,13 +416,28 @@ func (a *Account) TotalSubs() int {
 	return int(a.sl.Count())
 }
 
+// SubscriptionInterest returns true if this account has a matching subscription
+// for the given `subject`. Works only for literal subjects.
+// TODO: Add support for wildcards
+func (a *Account) SubscriptionInterest(subject string) bool {
+	var interest bool
+	a.mu.RLock()
+	if a.sl != nil {
+		if res := a.sl.Match(subject); len(res.psubs)+len(res.qsubs) > 0 {
+			interest = true
+		}
+	}
+	a.mu.RUnlock()
+	return interest
+}
+
 // addClient keeps our accounting of local active clients or leafnodes updated.
 // Returns previous total.
 func (a *Account) addClient(c *client) int {
 	a.mu.Lock()
 	n := len(a.clients)
 	if a.clients != nil {
-		a.clients[c] = c
+		a.clients[c] = struct{}{}
 	}
 	added := n != len(a.clients)
 	if added {
@@ -398,9 +449,11 @@ func (a *Account) addClient(c *client) int {
 		}
 	}
 	a.mu.Unlock()
-	if c != nil && c.srv != nil && a != c.srv.globalAccount() && added {
+
+	if c != nil && c.srv != nil && added {
 		c.srv.accConnsUpdate(a)
 	}
+
 	return n
 }
 
@@ -455,7 +508,7 @@ func (a *Account) randomClient() *client {
 	if a.siReplyClient != nil {
 		return a.siReplyClient
 	}
-	for _, c = range a.clients {
+	for c = range a.clients {
 		break
 	}
 	return c
@@ -1043,6 +1096,8 @@ func (a *Account) createRespWildcard() []byte {
 			a.siReplyClient = c
 			a.mu.Unlock()
 		}
+		// Now check on leafnode updates.
+		s.updateLeafNodes(a, sub, 1)
 	}
 
 	return pre
@@ -1425,7 +1480,7 @@ func (a *Account) streamActivationExpired(exportAcc *Account, subject string) {
 	a.mu.Lock()
 	si.invalid = true
 	clients := make([]*client, 0, len(a.clients))
-	for _, c := range a.clients {
+	for c := range a.clients {
 		clients = append(clients, c)
 	}
 	awcsti := map[string]struct{}{a.Name: {}}
@@ -1470,6 +1525,16 @@ func (a *Account) activationExpired(exportAcc *Account, subject string, kind jwt
 	}
 }
 
+func isRevoked(revocations map[string]int64, subject string, issuedAt int64) bool {
+	if revocations == nil {
+		return false
+	}
+	if t, ok := revocations[subject]; !ok || t < issuedAt {
+		return false
+	}
+	return true
+}
+
 // checkActivation will check the activation token for validity.
 func (a *Account) checkActivation(importAcc *Account, claim *jwt.Import, expTimer bool) bool {
 	if claim == nil || claim.Token == "" {
@@ -1491,12 +1556,12 @@ func (a *Account) checkActivation(importAcc *Account, claim *jwt.Import, expTime
 	if err != nil {
 		return false
 	}
+	if !a.isIssuerClaimTrusted(act) {
+		return false
+	}
 	vr = jwt.CreateValidationResults()
 	act.Validate(vr)
 	if vr.IsBlocking(true) {
-		return false
-	}
-	if !a.isIssuerClaimTrusted(act) {
 		return false
 	}
 	if act.Expires != 0 {
@@ -1512,13 +1577,7 @@ func (a *Account) checkActivation(importAcc *Account, claim *jwt.Import, expTime
 		}
 	}
 	// Check for token revocation..
-	if a.actsRevoked != nil {
-		if t, ok := a.actsRevoked[act.Subject]; ok && t <= time.Now().Unix() {
-			return false
-		}
-	}
-
-	return true
+	return !isRevoked(a.actsRevoked, act.Subject, act.IssuedAt)
 }
 
 // Returns true if the activation claim is trusted. That is the issuer matches
@@ -1655,16 +1714,10 @@ func (a *Account) clearExpirationTimer() bool {
 }
 
 // checkUserRevoked will check if a user has been revoked.
-func (a *Account) checkUserRevoked(nkey string) bool {
+func (a *Account) checkUserRevoked(nkey string, issuedAt int64) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if a.usersRevoked == nil {
-		return false
-	}
-	if t, ok := a.usersRevoked[nkey]; !ok || t > time.Now().Unix() {
-		return false
-	}
-	return true
+	return isRevoked(a.usersRevoked, nkey, issuedAt)
 }
 
 // Check expiration and set the proper state as needed.
@@ -1710,6 +1763,14 @@ func (a *Account) hasIssuerNoLock(issuer string) bool {
 	return false
 }
 
+// Returns the loop detection subject used for leafnodes
+func (a *Account) getLDSubject() string {
+	a.mu.RLock()
+	lds := a.lds
+	a.mu.RUnlock()
+	return lds
+}
+
 // Placeholder for signaling token auth required.
 var tokenAuthReq = []*Account{}
 
@@ -1744,6 +1805,14 @@ func (s *Server) UpdateAccountClaims(a *Account, ac *jwt.AccountClaims) {
 // This will replace any exports or imports previously defined.
 // Lock MUST NOT be held upon entry.
 func (s *Server) updateAccountClaims(a *Account, ac *jwt.AccountClaims) {
+	s.updateAccountClaimsWithRefresh(a, ac, true)
+}
+
+// updateAccountClaimsWithRefresh will update an existing account with new claims.
+// If refreshImportingAccounts is true it will also update incomplete dependent accounts
+// This will replace any exports or imports previously defined.
+// Lock MUST NOT be held upon entry.
+func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaims, refreshImportingAccounts bool) {
 	if a == nil {
 		return
 	}
@@ -1795,7 +1864,7 @@ func (s *Server) updateAccountClaims(a *Account, ac *jwt.AccountClaims) {
 	gatherClients := func() []*client {
 		a.mu.RLock()
 		clients := make([]*client, 0, len(a.clients))
-		for _, c := range a.clients {
+		for c := range a.clients {
 			clients = append(clients, c)
 		}
 		a.mu.RUnlock()
@@ -1839,10 +1908,12 @@ func (s *Server) updateAccountClaims(a *Account, ac *jwt.AccountClaims) {
 			a.mu.Unlock()
 		}
 	}
+	var incompleteImports []*jwt.Import
 	for _, i := range ac.Imports {
 		acc, err := s.lookupAccount(i.Account)
 		if acc == nil || err != nil {
 			s.Errorf("Can't locate account [%s] for import of [%v] %s (err=%v)", i.Account, i.Subject, i.Type, err)
+			incompleteImports = append(incompleteImports, i)
 			continue
 		}
 		switch i.Type {
@@ -1850,11 +1921,13 @@ func (s *Server) updateAccountClaims(a *Account, ac *jwt.AccountClaims) {
 			s.Debugf("Adding stream import %s:%q for %s:%q", acc.Name, i.Subject, a.Name, i.To)
 			if err := a.AddStreamImportWithClaim(acc, string(i.Subject), string(i.To), i); err != nil {
 				s.Debugf("Error adding stream import to account [%s]: %v", a.Name, err.Error())
+				incompleteImports = append(incompleteImports, i)
 			}
 		case jwt.Service:
 			s.Debugf("Adding service import %s:%q for %s:%q", acc.Name, i.Subject, a.Name, i.To)
 			if err := a.AddServiceImportWithClaim(acc, string(i.Subject), string(i.To), i); err != nil {
 				s.Debugf("Error adding service import to account [%s]: %v", a.Name, err.Error())
+				incompleteImports = append(incompleteImports, i)
 			}
 		}
 	}
@@ -1885,7 +1958,7 @@ func (s *Server) updateAccountClaims(a *Account, ac *jwt.AccountClaims) {
 					// Check for if we are still authorized for an import.
 					im.invalid = !a.checkStreamImportAuthorized(acc, im.from, im.claim)
 					awcsti[acc.Name] = struct{}{}
-					for _, c := range acc.clients {
+					for c := range acc.clients {
 						clients[c] = struct{}{}
 					}
 				}
@@ -1935,6 +2008,12 @@ func (s *Server) updateAccountClaims(a *Account, ac *jwt.AccountClaims) {
 		for pk, t := range ac.Revocations {
 			a.usersRevoked[pk] = t
 		}
+	} else {
+		a.usersRevoked = nil
+	}
+	a.incomplete = len(incompleteImports) != 0
+	for _, i := range incompleteImports {
+		s.incompleteAccExporterMap.Store(i.Account, struct{}{})
 	}
 	a.mu.Unlock()
 
@@ -1945,7 +2024,7 @@ func (s *Server) updateAccountClaims(a *Account, ac *jwt.AccountClaims) {
 			return clients[i].start.After(clients[j].start)
 		})
 	}
-	now := time.Now().Unix()
+
 	for i, c := range clients {
 		a.mu.RLock()
 		exceeded := a.mconns != jwt.NoLimit && i >= int(a.mconns)
@@ -1956,17 +2035,16 @@ func (s *Server) updateAccountClaims(a *Account, ac *jwt.AccountClaims) {
 		}
 		c.mu.Lock()
 		c.applyAccountLimits()
-		// Check for being revoked here. We use ac one to avoid
-		// the account lock.
-		var nkey string
-		if c.user != nil {
-			nkey = c.user.Nkey
-		}
+		theJWT := c.opts.JWT
 		c.mu.Unlock()
 
-		// Check if we have been revoked.
-		if ac.Revocations != nil {
-			if t, ok := ac.Revocations[nkey]; ok && now >= t {
+		// Check for being revoked here. We use ac one to avoid the account lock.
+		if ac.Revocations != nil && theJWT != "" {
+			if juc, err := jwt.DecodeUserClaims(theJWT); err != nil {
+				c.Debugf("User JWT not valid: %v", err)
+				c.authViolation()
+				continue
+			} else if ok := ac.IsClaimRevoked(juc); ok {
 				c.sendErrAndDebug("User Authentication Revoked")
 				c.closeConnection(Revocation)
 				continue
@@ -1984,6 +2062,36 @@ func (s *Server) updateAccountClaims(a *Account, ac *jwt.AccountClaims) {
 				c.closeConnection(AuthenticationViolation)
 			}
 		}
+	}
+
+	if _, ok := s.incompleteAccExporterMap.Load(old.Name); ok && refreshImportingAccounts {
+		s.incompleteAccExporterMap.Delete(old.Name)
+		s.accounts.Range(func(key, value interface{}) bool {
+			acc := value.(*Account)
+			acc.mu.RLock()
+			incomplete := acc.incomplete
+			name := acc.Name
+			// Must use jwt in account or risk failing on fetch
+			// This jwt may not be the same that caused exportingAcc to be in incompleteAccExporterMap
+			claimJWT := acc.claimJWT
+			acc.mu.RUnlock()
+			if incomplete && name != old.Name {
+				if accClaims, _, err := s.verifyAccountClaims(claimJWT); err == nil {
+					// Since claimJWT has not changed, acc can become complete
+					// but it won't alter incomplete for it's dependents accounts.
+					s.updateAccountClaimsWithRefresh(acc, accClaims, false)
+					// old.Name was deleted before ranging over accounts
+					// If it exists again, UpdateAccountClaims set it for failed imports of acc.
+					// So there was one import of acc that imported this account and failed again.
+					// Since this account just got updated, the import itself may be in error. So trace that.
+					if _, ok := s.incompleteAccExporterMap.Load(old.Name); ok {
+						s.incompleteAccExporterMap.Delete(old.Name)
+						s.Errorf("Account %s has issues importing account %s", name, old.Name)
+					}
+				}
+			}
+			return true
+		})
 	}
 }
 

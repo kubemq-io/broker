@@ -15,6 +15,7 @@ package server
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -24,8 +25,13 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
-	"github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/server/stan/spb"
+	"github.com/kubemq-io/broker/client/nats"
+)
+
+const (
+	addClusterNodeSubj    = defaultRaftPrefix + ".%s.node.add"
+	removeClusterNodeSubj = defaultRaftPrefix + ".%s.node.remove"
 )
 
 const (
@@ -63,6 +69,12 @@ type ClusteringOptions struct {
 	TrailingLogs int64    // Number of logs left after a snapshot.
 	Sync         bool     // Do a file sync after every write to the Raft log and message store.
 	RaftLogging  bool     // Enable logging of Raft library (disabled by default since really verbose).
+
+	// If this is enabled, the leader of the cluster will listen to add/remove
+	// requests on NATS subject "_STAN.raft.<cluster ID>.node.[add|remove]".
+	// Admin can/should limit permissions to send to this subject to prevent
+	// a user to inadvertently change the cluster configuration.
+	AllowAddRemoveNode bool
 
 	// When a node processes a snapshot (either on startup or if falling behind) and its is
 	// not in phase with the message store's state, it is required to reconcile its state
@@ -297,6 +309,7 @@ func (s *StanServer) createRaftNode(name string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	store.setCacheSize(s.opts.Clustering.LogCacheSize)
 
 	// Go through the list of channels that we have recovered from streaming store
 	// and set their corresponding UID.
@@ -310,12 +323,6 @@ func (s *StanServer) createRaftNode(name string) (bool, error) {
 		c.id = id
 	}
 	s.channels.Unlock()
-
-	cacheStore, err := raft.NewLogCache(s.opts.Clustering.LogCacheSize, store)
-	if err != nil {
-		store.Close()
-		return false, err
-	}
 
 	addr := s.getClusteringAddr(name)
 	config := raft.DefaultConfig()
@@ -383,7 +390,7 @@ func (s *StanServer) createRaftNode(name string) (bool, error) {
 		fsm.Unlock()
 	}
 	s.raft.fsm = fsm
-	node, err := raft.NewRaft(config, fsm, cacheStore, store, snapshotStore, transport)
+	node, err := raft.NewRaft(config, fsm, store, store, snapshotStore, transport)
 	if err != nil {
 		transport.Close()
 		store.Close()
@@ -392,7 +399,7 @@ func (s *StanServer) createRaftNode(name string) (bool, error) {
 	if testPauseAfterNewRaftCalled {
 		time.Sleep(time.Second)
 	}
-	existingState, err := raft.HasExistingState(cacheStore, store, snapshotStore)
+	existingState, err := raft.HasExistingState(store, store, snapshotStore)
 	if err != nil {
 		node.Shutdown()
 		transport.Close()
@@ -676,4 +683,48 @@ func (r *raftFSM) lookupOrCreateChannel(name string, id uint64) (*channel, error
 	}
 	// Channel does exist or has been deleted. Create now with given ID.
 	return cs.createChannelLocked(s, name, id)
+}
+
+func (s *StanServer) processAddNode(m *nats.Msg) {
+	var err error
+	nodeID := string(m.Data)
+	if nodeID != "" {
+		addr := s.getClusteringPeerAddr(s.opts.ID, nodeID)
+		err = s.raft.AddVoter(raft.ServerID(nodeID), raft.ServerAddress(addr), 0, 0).Error()
+		if err == nil {
+			s.log.Noticef("Added node %q", nodeID)
+			m.Respond([]byte("+OK"))
+			return
+		}
+	} else {
+		err = errors.New("invalid node ID")
+	}
+	s.log.Errorf("Error adding node %q: %v", nodeID, err)
+	m.Respond([]byte(fmt.Sprintf("-ERR adding node %q: %v", nodeID, err)))
+}
+
+func (s *StanServer) processRemoveNode(m *nats.Msg) {
+	nodeID := string(m.Data)
+	err := s.raft.RemoveServer(raft.ServerID(nodeID), 0, 0).Error()
+	if err == nil {
+		s.log.Noticef("Removed node %q", nodeID)
+		m.Respond([]byte("+OK"))
+		if nodeID == s.opts.Clustering.NodeID {
+			s.nc.Flush()
+			// Wait that we step down...
+			timeout := time.Now().Add(5 * time.Second)
+			for time.Now().Before(timeout) {
+				if atomic.LoadInt64(&(s.raft.leader)) == 0 {
+					break
+				}
+			}
+			s.Shutdown()
+			if !runningInTests {
+				os.Exit(0)
+			}
+		}
+		return
+	}
+	s.log.Errorf("Error removing node %q: %v", nodeID, err)
+	m.Respond([]byte(fmt.Sprintf("-ERR removing node %q: %v", nodeID, err)))
 }

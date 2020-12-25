@@ -29,11 +29,12 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
-	"github.com/kubemq-io/broker/client/nats"
-	"github.com/kubemq-io/broker/client/stan/pb"
 	natsd "github.com/kubemq-io/broker/server/gnatsd/server"
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
 	"github.com/kubemq-io/broker/server/stan/stores"
+	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/stan"
+	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 const (
@@ -125,7 +126,7 @@ func TestMonitorStartOwnHTTPServer(t *testing.T) {
 	nOpts.HTTPHost = monitorHost
 	nOpts.HTTPPort = monitorPort
 	sOpts := GetDefaultOptions()
-	sOpts.NATSServerURL = "nats://localhost:4222"
+	sOpts.NATSServerURL = "nats://127.0.0.1:4222"
 	s := runServerWithOpts(t, sOpts, &nOpts)
 	defer s.Shutdown()
 
@@ -148,7 +149,7 @@ func TestMonitorStartOwnHTTPSServer(t *testing.T) {
 	}
 	nOpts.TLSConfig.Certificates = []tls.Certificate{cert}
 	sOpts := GetDefaultOptions()
-	sOpts.NATSServerURL = "nats://localhost:4222"
+	sOpts.NATSServerURL = "nats://127.0.0.1:4222"
 	s := runServerWithOpts(t, sOpts, &nOpts)
 	defer s.Shutdown()
 

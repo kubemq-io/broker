@@ -179,6 +179,26 @@ func ProcessConfigFile(configFile string, opts *Options) error {
 			}
 			opts.Encrypt = true
 			opts.EncryptionKey = []byte(v.(string))
+		case "username", "user":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.Username = v.(string)
+		case "password", "pass":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.Password = v.(string)
+		case "token":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.Token = v.(string)
+		case "nkey_seed_file":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.NKeySeedFile = v.(string)
 		}
 	}
 	return nil
@@ -292,6 +312,11 @@ func parseCluster(itf interface{}, opts *Options) error {
 				return err
 			}
 			opts.Clustering.ProceedOnRestoreFailure = v.(bool)
+		case "allow_add_remove_node":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.Clustering.AllowAddRemoveNode = v.(bool)
 		case "raft_logging":
 			if err := checkType(k, reflect.Bool, v); err != nil {
 				return err
@@ -652,6 +677,7 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.BoolVar(&sopts.Clustering.Sync, "cluster_sync", false, "stan.Clustering.Sync")
 	fs.BoolVar(&sopts.Clustering.RaftLogging, "cluster_raft_logging", false, "")
 	fs.BoolVar(&sopts.Clustering.ProceedOnRestoreFailure, "cluster_proceed_on_restore_failure", false, "")
+	fs.BoolVar(&sopts.Clustering.AllowAddRemoveNode, "cluster_allow_add_remove_node", false, "")
 	fs.StringVar(&sopts.SQLStoreOpts.Driver, "sql_driver", "", "SQL Driver")
 	fs.StringVar(&sopts.SQLStoreOpts.Source, "sql_source", "", "SQL Data Source")
 	defSQLOpts := stores.DefaultSQLStoreOptions()
@@ -735,6 +761,8 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 			var i64 int64
 			i64, flagErr = getBytes(f)
 			sopts.FileStoreOpts.ReadBufferSize = int(i64)
+		case "file_slice_max_bytes":
+			sopts.FileStoreOpts.SliceMaxBytes, flagErr = getBytes(f)
 		}
 	})
 	if flagErr != nil {

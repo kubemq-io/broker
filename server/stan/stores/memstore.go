@@ -18,9 +18,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kubemq-io/broker/client/stan/pb"
 	"github.com/kubemq-io/broker/server/stan/logger"
 	"github.com/kubemq-io/broker/server/stan/util"
+	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 // MemoryStore is a factory for message and subscription stores.

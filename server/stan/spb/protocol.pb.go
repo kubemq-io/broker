@@ -115,9 +115,7 @@ var RaftOperation_Type_value = map[string]int32{
 func (x RaftOperation_Type) String() string {
 	return proto.EnumName(RaftOperation_Type_name, int32(x))
 }
-func (RaftOperation_Type) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptorProtocol, []int{9, 0}
-}
+func (RaftOperation_Type) EnumDescriptor() ([]byte, []int) { return fileDescriptorProtocol, []int{9, 0} }
 
 // SubState represents the state of a Subscription
 type SubState struct {

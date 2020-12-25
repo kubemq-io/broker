@@ -24,11 +24,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/stan/pb"
-	"github.com/kubemq-io/broker/pkg/nuid"
 	"github.com/kubemq-io/broker/server/stan/logger"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/test"
+	"github.com/kubemq-io/broker/pkg/nuid"
+	"github.com/kubemq-io/broker/client/stan/pb"
 )
 
 var testDefaultStoreLimits = StoreLimits{
