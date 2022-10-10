@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/kubemq-io/broker/client/nats"
+	"github.com/kubemq-io/broker/client/stan"
 	"github.com/kubemq-io/broker/client/stan/pb"
 	natsd "github.com/kubemq-io/broker/server/gnatsd/server"
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
@@ -158,7 +159,7 @@ func TestPartitionsMaxPayload(t *testing.T) {
 	defer ns.Shutdown()
 
 	opts1 := GetDefaultOptions()
-	opts1.NATSServerURL = "nats://localhost:4222"
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
 	opts1.Partitioning = true
 	opts1.StoreLimits.AddPerChannel("foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo", &stores.ChannelLimits{})
 	failSrv, err := RunServerWithOpts(opts1, nil)
@@ -178,7 +179,7 @@ func TestPartitionsMaxPayload(t *testing.T) {
 	defer ns.Shutdown()
 
 	opts1 = GetDefaultOptions()
-	opts1.NATSServerURL = "nats://localhost:4222"
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
 	opts1.Partitioning = true
 	opts1.StoreLimits.AddPerChannel("foo", &stores.ChannelLimits{})
 	s1 := runServerWithOpts(t, opts1, nil)
@@ -215,7 +216,7 @@ func TestPartitionsMaxPayload(t *testing.T) {
 	}
 
 	opts2 := GetDefaultOptions()
-	opts2.NATSServerURL = "nats://localhost:4222"
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
 	opts2.Partitioning = true
 	for i := 0; i < total-1; i++ {
 		channelName := fmt.Sprintf("channel.number.%d", (i + 1))
@@ -300,14 +301,14 @@ func TestPartitionsWithClusterOfServers(t *testing.T) {
 	barSubj := "bar"
 
 	opts1 := GetDefaultOptions()
-	opts1.NATSServerURL = "nats://localhost:4222"
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
 	opts1.Partitioning = true
 	opts1.StoreLimits.AddPerChannel(fooSubj, &stores.ChannelLimits{})
 	s1 := runServerWithOpts(t, opts1, nil)
 	defer s1.Shutdown()
 
 	opts2 := GetDefaultOptions()
-	opts2.NATSServerURL = "nats://localhost:4222"
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
 	opts2.Partitioning = true
 	opts2.StoreLimits.AddPerChannel(barSubj, &stores.ChannelLimits{})
 	s2 := runServerWithOpts(t, opts2, nil)
@@ -384,7 +385,7 @@ func TestPartitionsDuplicatedOnTwoServers(t *testing.T) {
 	barSubj := "bar"
 
 	opts1 := GetDefaultOptions()
-	opts1.NATSServerURL = "nats://localhost:4222"
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
 	opts1.Partitioning = true
 	opts1.StoreLimits.AddPerChannel(fooSubj, &stores.ChannelLimits{})
 	opts1.StoreLimits.AddPerChannel(barSubj, &stores.ChannelLimits{})
@@ -392,7 +393,7 @@ func TestPartitionsDuplicatedOnTwoServers(t *testing.T) {
 	defer s1.Shutdown()
 
 	opts2 := GetDefaultOptions()
-	opts2.NATSServerURL = "nats://localhost:4222"
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
 	opts2.Partitioning = true
 	opts2.StoreLimits.AddPerChannel(barSubj, &stores.ChannelLimits{})
 	// Expecting this to fail
@@ -416,7 +417,7 @@ func TestPartitionsConflictDueToWildcards(t *testing.T) {
 	defer s1.Shutdown()
 
 	opts2 := GetDefaultOptions()
-	opts2.NATSServerURL = "nats://localhost:4222"
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
 	opts2.Partitioning = true
 	opts2.StoreLimits.AddPerChannel("foo.bar", &stores.ChannelLimits{})
 	// Expecting this to fail
@@ -931,7 +932,7 @@ func TestPartitionsAndFT(t *testing.T) {
 	opts := getTestFTDefaultOptions()
 	opts.Partitioning = true
 	opts.AddPerChannel("foo", &stores.ChannelLimits{})
-	opts.NATSServerURL = "nats://localhost:4222"
+	opts.NATSServerURL = "nats://127.0.0.1:4222"
 
 	ft1 := runServerWithOpts(t, opts, nil)
 	defer ft1.Shutdown()
@@ -968,14 +969,14 @@ func TestPartitionsClientPings(t *testing.T) {
 	barSubj := "bar"
 
 	opts1 := GetDefaultOptions()
-	opts1.NATSServerURL = "nats://localhost:4222"
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
 	opts1.Partitioning = true
 	opts1.StoreLimits.AddPerChannel(fooSubj, &stores.ChannelLimits{})
 	s1 := runServerWithOpts(t, opts1, nil)
 	defer s1.Shutdown()
 
 	opts2 := GetDefaultOptions()
-	opts2.NATSServerURL = "nats://localhost:4222"
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
 	opts2.Partitioning = true
 	opts2.StoreLimits.AddPerChannel(barSubj, &stores.ChannelLimits{})
 	s2 := runServerWithOpts(t, opts2, nil)

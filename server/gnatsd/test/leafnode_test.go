@@ -35,7 +35,7 @@ import (
 	"github.com/kubemq-io/broker/pkg/nuid"
 	"github.com/kubemq-io/broker/server/gnatsd/logger"
 	"github.com/kubemq-io/broker/server/gnatsd/server"
-	"github.com/nats-io/jwt"
+	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nkeys"
 )
 

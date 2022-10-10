@@ -741,7 +741,9 @@ func checkFileVersion(r io.Reader) error {
 // writeRecord writes a record to `w`.
 // The record layout is as follows:
 // 8 bytes: 4 bytes for type and/or size combined
-//          4 bytes for CRC-32
+//
+//	4 bytes for CRC-32
+//
 // variable bytes: payload.
 // If a buffer is provided, this function uses it and expands it if necessary.
 // The function returns the buffer (possibly changed due to expansion) and the
@@ -793,7 +795,7 @@ func writeRecord(w io.Writer, buf []byte, recType recordType, rec record, recSiz
 }
 
 // readRecord reads a record from `r`, possibly checking the CRC-32 checksum.
-// When `buf`` is not nil, this function ensures the buffer is big enough to
+// When `buf“ is not nil, this function ensures the buffer is big enough to
 // hold the payload (expanding if necessary). Therefore, this call always
 // return `buf`, regardless if there is an error or not.
 // The caller is indicating if the record is supposed to be typed or not.
@@ -1344,13 +1346,13 @@ func (fs *FileStore) Recover() (*RecoveredState, error) {
 	// in APPEND mode to allow truncate to work).
 	fs.serverFile, err = fs.fm.createFile(serverFileName, os.O_RDWR|os.O_CREATE, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to recover server file %q: %v", serverFileName, err)
 	}
 
 	// Open/Create the client file.
 	fs.clientsFile, err = fs.fm.createFile(clientsFileName, defaultFileFlags, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to recover client file %q: %v", clientsFileName, err)
 	}
 
 	// Recover the server file.
@@ -2016,6 +2018,7 @@ func (fs *FileStore) newFileMsgStore(channelDirName, channel string, limits *Msg
 
 	// Use this variable for all errors below so we can do the cleanup
 	var err error
+	var fname string
 
 	// Recovery case
 	if doRecover {
@@ -2048,11 +2051,13 @@ func (fs *FileStore) newFileMsgStore(channelDirName, channel string, limits *Msg
 			if s, statErr := os.Stat(filepath.Join(channelDirName, idxFName)); s != nil && statErr == nil {
 				useIdxFile = true
 			}
-			datFile, err = ms.fm.createFile(filepath.Join(channel, fileName), defaultFileFlags, nil)
+			fname = filepath.Join(channel, fileName)
+			datFile, err = ms.fm.createFile(fname, defaultFileFlags, nil)
 			if err != nil {
 				break
 			}
-			idxFile, err = ms.fm.createFile(filepath.Join(channel, idxFName), defaultFileFlags, nil)
+			fname = filepath.Join(channel, idxFName)
+			idxFile, err = ms.fm.createFile(fname, defaultFileFlags, nil)
 			if err != nil {
 				ms.fm.unlockFile(datFile)
 				break
@@ -2125,7 +2130,7 @@ func (fs *FileStore) newFileMsgStore(channelDirName, channel string, limits *Msg
 		if doRecover {
 			action = "recover"
 		}
-		err = fmt.Errorf("unable to %s message store for [%s]: %v", action, channel, err)
+		err = fmt.Errorf("unable to %s message store for [%s](file: %q): %v", action, channel, fname, err)
 		return nil, err
 	}
 
@@ -2210,8 +2215,12 @@ func (ms *FileMsgStore) doLockFiles(fslice *fileSlice, onlyIndexFile bool) error
 	}
 	idxWasOpened, err = ms.fm.lockFile(fslice.idxFile)
 	if err != nil {
-		if !datWasOpened {
-			ms.fm.unlockFile(fslice.file)
+		if !onlyIndexFile {
+			if !datWasOpened {
+				ms.fm.closeLockedFile(fslice.file)
+			} else {
+				ms.fm.unlockFile(fslice.file)
+			}
 		}
 		return err
 	}
@@ -2374,6 +2383,9 @@ func (ms *FileMsgStore) recoverOneMsgFile(fslice *fileSlice, fseq int, useIdxFil
 
 		// We are going to write the index file while recovering the data file
 		bw := bufio.NewWriterSize(fslice.idxFile.handle, msgIndexRecSize*1000)
+
+		// Reset offset in case we come from a mismatch between .dat and .idx files.
+		offset = int64(4)
 
 		for {
 			ms.tmpMsgBuf, msgSize, _, err = readRecord(br, ms.tmpMsgBuf, false, crcTable, doCRC)
@@ -3872,7 +3884,7 @@ func (ms *FileMsgStore) Empty() error {
 ////////////////////////////////////////////////////////////////////////////
 
 // newFileSubStore returns a new instace of a file SubStore.
-func (fs *FileStore) newFileSubStore(channel string, limits *SubStoreLimits, doRecover bool) (*FileSubStore, error) {
+func (fs *FileStore) newFileSubStore(channel string, limits *SubStoreLimits, doRecover bool) (fss *FileSubStore, retErr error) {
 	ss := &FileSubStore{
 		fstore:   fs,
 		fm:       fs.fm,
@@ -3883,8 +3895,17 @@ func (fs *FileStore) newFileSubStore(channel string, limits *SubStoreLimits, doR
 	// Convert the CompactInterval in time.Duration
 	ss.compactItvl = time.Duration(ss.opts.CompactInterval) * time.Second
 
-	var err error
+	defer func() {
+		if retErr != nil {
+			action := "create"
+			if doRecover {
+				action = "recover"
+			}
+			retErr = fmt.Errorf("unable to %s subscription store for [%s]: %v", action, channel, retErr)
+		}
+	}()
 
+	var err error
 	fileName := filepath.Join(channel, subsFileName)
 	ss.file, err = fs.fm.createFile(fileName, defaultFileFlags, func() error {
 		ss.writer = nil
@@ -3905,7 +3926,7 @@ func (fs *FileStore) newFileSubStore(channel string, limits *SubStoreLimits, doR
 		if err := ss.recoverSubscriptions(); err != nil {
 			fs.fm.unlockFile(ss.file)
 			ss.Close()
-			return nil, fmt.Errorf("unable to recover subscription store for [%s]: %v", channel, err)
+			return nil, err
 		}
 	}
 	// Do not attempt to shrink unless the option is greater than the

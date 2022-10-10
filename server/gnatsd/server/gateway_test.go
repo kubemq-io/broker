@@ -22,14 +22,15 @@ import (
 	"net"
 	"net/url"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/server/gnatsd/logger"
+	"github.com/nats-io/nats.go"
 )
 
 func init() {
@@ -494,17 +495,28 @@ func TestGatewaySolicitDelayWithImplicitOutbounds(t *testing.T) {
 	waitForInboundGateways(t, s1, 1, time.Second)
 }
 
-type slowResolver struct{}
+type slowResolver struct {
+	inLookupCh chan struct{}
+	releaseCh  chan struct{}
+}
 
 func (r *slowResolver) LookupHost(ctx context.Context, h string) ([]string, error) {
-	time.Sleep(500 * time.Millisecond)
+	if r.inLookupCh != nil {
+		select {
+		case r.inLookupCh <- struct{}{}:
+		default:
+		}
+		<-r.releaseCh
+	} else {
+		time.Sleep(500 * time.Millisecond)
+	}
 	return []string{h}, nil
 }
 
 func TestGatewaySolicitShutdown(t *testing.T) {
 	var urls []string
 	for i := 0; i < 5; i++ {
-		u := fmt.Sprintf("nats://127.0.0.1:%d", 1234+i)
+		u := fmt.Sprintf("nats://localhost:%d", 1234+i)
 		urls = append(urls, u)
 	}
 	o1 := testGatewayOptionsFromToWithURLs(t, "A", "B", urls)
@@ -1054,6 +1066,55 @@ func TestGatewayImplicitReconnect(t *testing.T) {
 	}
 }
 
+func TestGatewayImplicitReconnectRace(t *testing.T) {
+	ob := testDefaultOptionsForGateway("B")
+	resolver := &slowResolver{
+		inLookupCh: make(chan struct{}, 1),
+		releaseCh:  make(chan struct{}),
+	}
+	ob.Gateway.resolver = resolver
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	oa1 := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa1 := runGatewayServer(oa1)
+	defer sa1.Shutdown()
+
+	// Wait for the proper connections
+	waitForOutboundGateways(t, sa1, 1, time.Second)
+	waitForOutboundGateways(t, sb, 1, time.Second)
+	waitForInboundGateways(t, sa1, 1, time.Second)
+	waitForInboundGateways(t, sb, 1, time.Second)
+
+	// On sb, change the URL to sa1 so that it is a name, instead of an IP,
+	// so that we hit the slow resolver.
+	cfg := sb.getRemoteGateway("A")
+	cfg.updateURLs([]string{fmt.Sprintf("localhost:%d", sa1.GatewayAddr().Port)})
+
+	// Shutdown sa1 now...
+	sa1.Shutdown()
+
+	// Wait to be notified that B has detected the connection close
+	// and it is trying to resolve the host during the reconnect.
+	<-resolver.inLookupCh
+
+	// Start a new "A" server (sa2).
+	oa2 := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa2 := runGatewayServer(oa2)
+	defer sa2.Shutdown()
+
+	// Make sure we have our outbound to sb registered on sa2 and inbound
+	// from sa2 on sb before releasing the resolver.
+	waitForOutboundGateways(t, sa2, 1, 2*time.Second)
+	waitForInboundGateways(t, sb, 1, 2*time.Second)
+
+	// Now release the resolver and ensure we have all connections.
+	close(resolver.releaseCh)
+
+	waitForOutboundGateways(t, sb, 1, 2*time.Second)
+	waitForInboundGateways(t, sa2, 1, 2*time.Second)
+}
+
 func TestGatewayURLsFromClusterSentInINFO(t *testing.T) {
 	o2 := testDefaultOptionsForGateway("B")
 	s2 := runGatewayServer(o2)
@@ -1389,7 +1450,7 @@ func TestGatewayAccountInterest(t *testing.T) {
 	// S2 and S3 should have sent a protocol indicating no account interest.
 	checkForAccountNoInterest(t, gwcb, "$foo", true, 2*time.Second)
 	checkForAccountNoInterest(t, gwcc, "$foo", true, 2*time.Second)
-	// Second send should not go through to B
+	// Second send should not go to B nor C.
 	natsPub(t, nc, "foo", []byte("hello"))
 	natsFlush(t, nc)
 	checkCount(t, gwcb, 1)
@@ -1409,12 +1470,9 @@ func TestGatewayAccountInterest(t *testing.T) {
 	defer ncS2.Close()
 	// Any subscription should cause s2 to send an A+
 	natsSubSync(t, ncS2, "asub")
-	checkFor(t, time.Second, 15*time.Millisecond, func() error {
-		if _, inMap := gwcb.gw.outsim.Load("$foo"); inMap {
-			return fmt.Errorf("NoInterest has not been cleared")
-		}
-		return nil
-	})
+	// Wait for the A+
+	checkForAccountNoInterest(t, gwcb, "$foo", false, 2*time.Second)
+
 	// Now publish a message that should go to B
 	natsPub(t, nc, "foo", []byte("hello"))
 	natsFlush(t, nc)
@@ -1422,11 +1480,21 @@ func TestGatewayAccountInterest(t *testing.T) {
 	// Still won't go to C since there is no sub interest
 	checkCount(t, gwcc, 1)
 
-	// By closing the client from S2, the sole subscription for this
-	// account will disappear and since S2 sent an A+, it will send
-	// an A-.
-	ncS2.Close()
+	// We should have received a subject no interest for foo
 	checkForSubjectNoInterest(t, gwcb, "$foo", "foo", true, 2*time.Second)
+
+	// Now if we close the client, which removed the sole subscription,
+	// and publish to a new subject, we should then get an A-
+	ncS2.Close()
+	// Wait a bit...
+	time.Sleep(20 * time.Millisecond)
+	// Publish on new subject
+	natsPub(t, nc, "bar", []byte("hello"))
+	natsFlush(t, nc)
+	// It should go out to B...
+	checkCount(t, gwcb, 3)
+	// But then we should get a A-
+	checkForAccountNoInterest(t, gwcb, "$foo", true, 2*time.Second)
 
 	// Restart C and that should reset the no-interest
 	s3.Shutdown()
@@ -1445,7 +1513,7 @@ func TestGatewayAccountInterest(t *testing.T) {
 	natsPub(t, nc, "foo", []byte("hello"))
 	natsFlush(t, nc)
 	// it should not go to B (no sub interest)
-	checkCount(t, gwcb, 2)
+	checkCount(t, gwcb, 3)
 	// but will go to C
 	checkCount(t, gwcc, 1)
 }
@@ -5529,24 +5597,35 @@ func TestGatewaySingleOutbound(t *testing.T) {
 	defer l.Close()
 	port := l.Addr().(*net.TCPAddr).Port
 
-	o1 := testGatewayOptionsFromToWithTLS(t, "A", "B", []string{fmt.Sprintf("nats://127.0.0.1:%d", port)})
-	o1.Gateway.TLSTimeout = 0.1
-	s1 := runGatewayServer(o1)
-	defer s1.Shutdown()
+	oa := testGatewayOptionsFromToWithTLS(t, "A", "B", []string{fmt.Sprintf("nats://127.0.0.1:%d", port)})
+	oa.Gateway.TLSTimeout = 0.1
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
 
-	buf := make([]byte, 10000)
-	// Check for a little bit that we don't have the situation
-	timeout := time.Now().Add(2 * time.Second)
-	for time.Now().Before(timeout) {
-		n := runtime.Stack(buf, true)
-		index := strings.Index(string(buf[:n]), "reconnectGateway")
-		if index != -1 {
-			newIndex := strings.LastIndex(string(buf[:n]), "reconnectGateway")
-			if newIndex > index {
-				t.Fatalf("Trying to reconnect twice for the same outbound!")
-			}
-		}
-		time.Sleep(15 * time.Millisecond)
+	// Wait a bit for reconnections
+	time.Sleep(500 * time.Millisecond)
+
+	// Now prepare gateway B to take place of the bare listener.
+	ob := testGatewayOptionsWithTLS(t, "B")
+	// There is a risk that when stopping the listener and starting
+	// the actual server, that port is being reused by some other process.
+	ob.Gateway.Port = port
+	l.Close()
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	// To make sure that we don't fail, bump the TLSTimeout now.
+	cfg := sa.getRemoteGateway("B")
+	cfg.Lock()
+	cfg.TLSTimeout = 2.0
+	cfg.Unlock()
+
+	waitForOutboundGateways(t, sa, 1, time.Second)
+	sa.gateway.Lock()
+	lm := len(sa.gateway.out)
+	sa.gateway.Unlock()
+	if lm != 1 {
+		t.Fatalf("Expected 1 outbound, got %v", lm)
 	}
 }
 
@@ -5849,4 +5928,77 @@ func TestGatewayNoCrashOnInvalidSubject(t *testing.T) {
 	if _, err := sub.NextMsg(time.Second); err != nil {
 		t.Fatalf("Error getting message: %v", err)
 	}
+}
+
+func TestGatewayUpdateURLsFromRemoteCluster(t *testing.T) {
+	ob1 := testDefaultOptionsForGateway("B")
+	sb1 := RunServer(ob1)
+	defer sb1.Shutdown()
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb1)
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+
+	waitForOutboundGateways(t, sa, 1, 2*time.Second)
+	waitForOutboundGateways(t, sb1, 1, 2*time.Second)
+
+	// Add a server to cluster B.
+	ob2 := testDefaultOptionsForGateway("B")
+	ob2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", ob1.Cluster.Port))
+	sb2 := RunServer(ob2)
+	defer sb2.Shutdown()
+
+	checkClusterFormed(t, sb1, sb2)
+	waitForOutboundGateways(t, sb2, 1, 2*time.Second)
+	waitForInboundGateways(t, sa, 2, 2*time.Second)
+
+	pmap := make(map[int]string)
+	pmap[ob1.Gateway.Port] = "B1"
+	pmap[ob2.Gateway.Port] = "B2"
+
+	checkURLs := func(eurls map[string]string) {
+		t.Helper()
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			rg := sa.getRemoteGateway("B")
+			urls := rg.getURLsAsStrings()
+			for _, u := range urls {
+				if _, ok := eurls[u]; !ok {
+					_, sport, _ := net.SplitHostPort(u)
+					port, _ := strconv.Atoi(sport)
+					return fmt.Errorf("URL %q (%s) should not be in the list of urls (%q)", u, pmap[port], eurls)
+				}
+			}
+			return nil
+		})
+	}
+	expected := make(map[string]string)
+	expected[fmt.Sprintf("127.0.0.1:%d", ob1.Gateway.Port)] = "B1"
+	expected[fmt.Sprintf("127.0.0.1:%d", ob2.Gateway.Port)] = "B2"
+	checkURLs(expected)
+
+	// Add another in cluster B
+	ob3 := testDefaultOptionsForGateway("B")
+	ob3.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", ob1.Cluster.Port))
+	sb3 := RunServer(ob3)
+	defer sb3.Shutdown()
+
+	checkClusterFormed(t, sb1, sb2, sb3)
+	waitForOutboundGateways(t, sb3, 1, 2*time.Second)
+	waitForInboundGateways(t, sa, 3, 2*time.Second)
+
+	pmap[ob3.Gateway.Port] = "B3"
+
+	expected = make(map[string]string)
+	expected[fmt.Sprintf("127.0.0.1:%d", ob1.Gateway.Port)] = "B1"
+	expected[fmt.Sprintf("127.0.0.1:%d", ob2.Gateway.Port)] = "B2"
+	expected[fmt.Sprintf("127.0.0.1:%d", ob3.Gateway.Port)] = "B3"
+	checkURLs(expected)
+
+	// Now stop server SB2, which should cause SA to remove it from its list.
+	sb2.Shutdown()
+
+	expected = make(map[string]string)
+	expected[fmt.Sprintf("127.0.0.1:%d", ob1.Gateway.Port)] = "B1"
+	expected[fmt.Sprintf("127.0.0.1:%d", ob3.Gateway.Port)] = "B3"
+	checkURLs(expected)
 }

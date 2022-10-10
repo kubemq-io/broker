@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kubemq-io/broker/client/stan"
 	"github.com/kubemq-io/broker/client/stan/pb"
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
 	"github.com/kubemq-io/broker/server/stan/stores"

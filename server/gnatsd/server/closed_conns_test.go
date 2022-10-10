@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/client/nats"
+	"github.com/nats-io/nats.go"
 )
 
 func checkClosedConns(t *testing.T, s *Server, num int, wait time.Duration) {

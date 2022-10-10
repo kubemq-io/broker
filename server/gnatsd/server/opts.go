@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -33,7 +34,7 @@ import (
 	"time"
 
 	"github.com/kubemq-io/broker/server/gnatsd/conf"
-	"github.com/nats-io/jwt"
+	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nkeys"
 )
 
@@ -125,7 +126,7 @@ type LeafNodeOpts struct {
 	// Not exported, for tests.
 	resolver    netResolver
 	dialTimeout time.Duration
-	loopDelay   time.Duration
+	connDelay   time.Duration
 }
 
 // RemoteLeafOpts are options for connecting to a remote server as a leaf node.
@@ -136,6 +137,9 @@ type RemoteLeafOpts struct {
 	TLS          bool        `json:"-"`
 	TLSConfig    *tls.Config `json:"-"`
 	TLSTimeout   float64     `json:"tls_timeout,omitempty"`
+	Hub          bool        `json:"hub,omitempty"`
+	DenyImports  []string    `json:"-"`
+	DenyExports  []string    `json:"-"`
 }
 
 // Options block for nats-server.
@@ -160,6 +164,7 @@ type Options struct {
 	Nkeys                 []*NkeyUser   `json:"-"`
 	Users                 []*User       `json:"-"`
 	Accounts              []*Account    `json:"-"`
+	NoAuthUser            string        `json:"-"`
 	SystemAccount         string        `json:"-"`
 	AllowNewAccounts      bool          `json:"-"`
 	Username              string        `json:"-"`
@@ -169,6 +174,7 @@ type Options struct {
 	MaxPingsOut           int           `json:"ping_max"`
 	HTTPHost              string        `json:"http_host"`
 	HTTPPort              int           `json:"http_port"`
+	HTTPBasePath          string        `json:"http_base_path"`
 	HTTPSPort             int           `json:"https_port"`
 	AuthTimeout           float64       `json:"auth_timeout"`
 	MaxControlLine        int32         `json:"max_control_line"`
@@ -589,6 +595,8 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 		o.HTTPPort = int(v.(int64))
 	case "https_port":
 		o.HTTPSPort = int(v.(int64))
+	case "http_base_path":
+		o.HTTPBasePath = v.(string)
 	case "cluster":
 		err := parseCluster(tk, o, errors, warnings)
 		if err != nil {
@@ -780,6 +788,8 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 				o.resolverPreloads[key] = jwtstr
 			}
 		}
+	case "no_auth_user":
+		o.NoAuthUser = v.(string)
 	case "system_account", "system":
 		// Already processed at the beginning so we just skip them
 		// to not treat them as unknown values.
@@ -1376,6 +1386,22 @@ func parseRemoteLeafNodes(v interface{}, errors *[]error, warnings *[]error) ([]
 				} else {
 					remote.TLSTimeout = float64(DEFAULT_LEAF_TLS_TIMEOUT)
 				}
+			case "hub":
+				remote.Hub = v.(bool)
+			case "deny_imports", "deny_import":
+				subjects, err := parseSubjects(tk, errors, warnings)
+				if err != nil {
+					*errors = append(*errors, err)
+					continue
+				}
+				remote.DenyImports = subjects
+			case "deny_exports", "deny_export":
+				subjects, err := parseSubjects(tk, errors, warnings)
+				if err != nil {
+					*errors = append(*errors, err)
+					continue
+				}
+				remote.DenyExports = subjects
 			default:
 				if !tk.IsUsedVariable() {
 					err := &unknownConfigFieldErr{
@@ -1858,10 +1884,11 @@ func parseAccount(v map[string]interface{}, errors, warnings *[]error) (string, 
 
 // Parse an export stream or service.
 // e.g.
-//   {stream: "public.>"} # No accounts means public.
-//   {stream: "synadia.private.>", accounts: [cncf, natsio]}
-//   {service: "pub.request"} # No accounts means public.
-//   {service: "pub.special.request", accounts: [nats.io]}
+//
+//	{stream: "public.>"} # No accounts means public.
+//	{stream: "synadia.private.>", accounts: [cncf, natsio]}
+//	{service: "pub.request"} # No accounts means public.
+//	{service: "pub.special.request", accounts: [nats.io]}
 func parseExportStreamOrService(v interface{}, errors, warnings *[]error) (*export, *export, error) {
 	var (
 		curStream  *export
@@ -2073,9 +2100,10 @@ func parseServiceLatency(root token, v interface{}) (l *serviceLatency, retErr e
 
 // Parse an import stream or service.
 // e.g.
-//   {stream: {account: "synadia", subject:"public.synadia"}, prefix: "imports.synadia"}
-//   {stream: {account: "synadia", subject:"synadia.private.*"}}
-//   {service: {account: "synadia", subject: "pub.special.request"}, to: "synadia.request"}
+//
+//	{stream: {account: "synadia", subject:"public.synadia"}, prefix: "imports.synadia"}
+//	{stream: {account: "synadia", subject:"synadia.private.*"}}
+//	{service: {account: "synadia", subject: "pub.special.request"}, to: "synadia.request"}
 func parseImportStreamOrService(v interface{}, errors, warnings *[]error) (*importStream, *importService, error) {
 	var (
 		curStream  *importStream
@@ -2232,14 +2260,22 @@ func parseAuthorization(v interface{}, opts *Options, errors *[]error, warnings 
 		}
 
 		// Now check for permission defaults with multiple users, etc.
-		if auth.users != nil && auth.defaultPermissions != nil {
-			for _, user := range auth.users {
-				if user.Permissions == nil {
-					user.Permissions = auth.defaultPermissions
+		if auth.defaultPermissions != nil {
+			if auth.users != nil {
+				for _, user := range auth.users {
+					if user.Permissions == nil {
+						user.Permissions = auth.defaultPermissions
+					}
+				}
+			}
+			if auth.nkeys != nil {
+				for _, user := range auth.nkeys {
+					if user.Permissions == nil {
+						user.Permissions = auth.defaultPermissions
+					}
 				}
 			}
 		}
-
 	}
 	return auth, nil
 }
@@ -2784,6 +2820,9 @@ func MergeOptions(fileOpts, flagOpts *Options) *Options {
 	if flagOpts.HTTPPort != 0 {
 		opts.HTTPPort = flagOpts.HTTPPort
 	}
+	if flagOpts.HTTPBasePath != "" {
+		opts.HTTPBasePath = flagOpts.HTTPBasePath
+	}
 	if flagOpts.Debug {
 		opts.Debug = true
 	}
@@ -3286,6 +3325,17 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	}
 
 	return opts, nil
+}
+
+func normalizeBasePath(p string) string {
+	if len(p) == 0 {
+		return "/"
+	}
+	// add leading slash
+	if p[0] != '/' {
+		p = "/" + p
+	}
+	return path.Clean(p)
 }
 
 // overrideTLS is called when at least "-tls=true" has been set.

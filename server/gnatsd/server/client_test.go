@@ -32,7 +32,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 
-	"github.com/kubemq-io/broker/client/nats"
+	"github.com/nats-io/nats.go"
 )
 
 type serverInfo struct {
@@ -1601,6 +1601,7 @@ func TestResponsePermissions(t *testing.T) {
 			svcNC := natsConnect(t, fmt.Sprintf("nats://service:pwd@%s:%d", opts.Host, opts.Port))
 			defer svcNC.Close()
 			reqSub := natsSubSync(t, svcNC, "request")
+			natsFlush(t, svcNC)
 
 			nc := natsConnect(t, fmt.Sprintf("nats://ivan:pwd@%s:%d", opts.Host, opts.Port))
 			defer nc.Close()
@@ -1948,6 +1949,10 @@ func (c *testConnWritePartial) Write(p []byte) (int, error) {
 	return c.buf.Write(p[:n])
 }
 
+func (c *testConnWritePartial) RemoteAddr() net.Addr {
+	return nil
+}
+
 func (c *testConnWritePartial) SetWriteDeadline(_ time.Time) error {
 	return nil
 }
@@ -1988,5 +1993,157 @@ func TestFlushOutboundNoSliceReuseIfPartial(t *testing.T) {
 	}
 	if !bytes.Equal(expected.Bytes(), fakeConn.buf.Bytes()) {
 		t.Fatalf("Expected\n%q\ngot\n%q", expected.String(), fakeConn.buf.String())
+	}
+}
+
+type captureNoticeLogger struct {
+	DummyLogger
+	notices []string
+}
+
+func (l *captureNoticeLogger) Noticef(format string, v ...interface{}) {
+	l.Lock()
+	l.notices = append(l.notices, fmt.Sprintf(format, v...))
+	l.Unlock()
+}
+
+func TestCloseConnectionLogsReason(t *testing.T) {
+	o1 := DefaultOptions()
+	s1 := RunServer(o1)
+	defer s1.Shutdown()
+
+	l := &captureNoticeLogger{}
+	s1.SetLogger(l, true, true)
+
+	o2 := DefaultOptions()
+	o2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o1.Cluster.Port))
+	s2 := RunServer(o2)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s1, s2)
+	s2.Shutdown()
+
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		if s1.NumRoutes() != 0 {
+			return fmt.Errorf("route still connected")
+		}
+		return nil
+	})
+	// Now check that s1 has logged that the connection is closed and that the reason is included.
+	ok := false
+	l.Lock()
+	for _, n := range l.notices {
+		if strings.Contains(n, "connection closed: "+ClientClosed.String()) {
+			ok = true
+			break
+		}
+	}
+	l.Unlock()
+	if !ok {
+		t.Fatal("Log does not contain closed reason")
+	}
+}
+
+func TestCloseConnectionVeryEarly(t *testing.T) {
+	o := DefaultOptions()
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	// The issue was with a connection that would break right when
+	// server was sending the INFO. Creating a bare TCP connection
+	// and closing it right away won't help reproduce the problem.
+	// So testing in 2 steps.
+
+	// Get a normal TCP connection to the server.
+	c, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", o.Port))
+	if err != nil {
+		s.mu.Unlock()
+		t.Fatalf("Unable to create tcp connection")
+	}
+	// Now close it.
+	c.Close()
+
+	// Wait that num clients falls to 0.
+	checkClientsCount(t, s, 0)
+
+	// Call again with this closed connection. Alternatively, we
+	// would have to call with a fake connection that implements
+	// net.Conn but returns an error on Write.
+	s.createClient(c)
+
+	// This connection should not have been added to the server.
+	checkClientsCount(t, s, 0)
+}
+
+type connAddrString struct {
+	net.Addr
+}
+
+func (a *connAddrString) String() string {
+	return "[fe80::abc:def:ghi:123%utun0]:4222"
+}
+
+type connString struct {
+	net.Conn
+}
+
+func (c *connString) RemoteAddr() net.Addr {
+	return &connAddrString{}
+}
+
+func TestClientConnectionName(t *testing.T) {
+	s, err := NewServer(DefaultOptions())
+	if err != nil {
+		t.Fatalf("Error creating server: %v", err)
+	}
+	l := &DummyLogger{}
+	s.SetLogger(l, true, true)
+
+	for _, test := range []struct {
+		name    string
+		kind    int
+		kindStr string
+	}{
+		{"client", CLIENT, "cid:"},
+		{"route", ROUTER, "rid:"},
+		{"gateway", GATEWAY, "gid:"},
+		{"leafnode", LEAF, "lid:"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := &client{srv: s, nc: &connString{}, kind: test.kind}
+			c.initClient()
+
+			if host := "fe80::abc:def:ghi:123%utun0"; host != c.host {
+				t.Fatalf("expected host to be %q, got %q", host, c.host)
+			}
+			if port := uint16(4222); port != c.port {
+				t.Fatalf("expected port to be %v, got %v", port, c.port)
+			}
+
+			checkLog := func(suffix string) {
+				t.Helper()
+				l.Lock()
+				msg := l.msg
+				l.Unlock()
+				if strings.Contains(msg, "(MISSING)") {
+					t.Fatalf("conn name was not escaped properly, got MISSING: %s", msg)
+				}
+				if !strings.Contains(l.msg, test.kindStr) {
+					t.Fatalf("expected kind to be %q, got: %s", test.kindStr, msg)
+				}
+				if !strings.HasSuffix(l.msg, suffix) {
+					t.Fatalf("expected statement to end with %q, got %s", suffix, msg)
+				}
+			}
+
+			c.Debugf("debug: %v", 1)
+			checkLog(" 1")
+			c.Tracef("trace: %s", "2")
+			checkLog(" 2")
+			c.Warnf("warn: %s %d", "3", 4)
+			checkLog(" 3 4")
+			c.Errorf("error: %v %s", 5, "6")
+			checkLog(" 5 6")
+		})
 	}
 }

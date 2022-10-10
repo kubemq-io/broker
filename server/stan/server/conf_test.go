@@ -84,6 +84,18 @@ func TestParseConfig(t *testing.T) {
 	if opts.NATSCredentials != "credentials.creds" {
 		t.Fatalf("Expected Credentials to be %q, got %q", "credentials.creds", opts.NATSCredentials)
 	}
+	if opts.Username != "user" {
+		t.Fatalf("Expected Username to be %q, got %q", "user", opts.Username)
+	}
+	if opts.Password != "password" {
+		t.Fatalf("Expected Password to be %q, got %q", "password", opts.Password)
+	}
+	if opts.NKeySeedFile != "seedfile" {
+		t.Fatalf("Expected NKeySeedFile to be %q, got %q", "seedfile", opts.NKeySeedFile)
+	}
+	if opts.Token != "token" {
+		t.Fatalf("Expected Token to be %q, got %q", "token", opts.Token)
+	}
 	if !opts.FileStoreOpts.CompactEnabled {
 		t.Fatalf("Expected CompactEnabled to be true, got false")
 	}
@@ -259,6 +271,9 @@ func TestParseConfig(t *testing.T) {
 	}
 	if opts.Clustering.RaftCommitTimeout != 50*time.Millisecond {
 		t.Fatalf("Expected RaftCommitTimeout to be 50ms, got %v", opts.Clustering.RaftCommitTimeout)
+	}
+	if !opts.Clustering.AllowAddRemoveNode {
+		t.Fatal("Expected AllowAddRemoveNode to be true")
 	}
 	if opts.SQLStoreOpts.Driver != "mysql" {
 		t.Fatalf("Expected SQL Driver to be %q, got %q", "mysql", opts.SQLStoreOpts.Driver)
@@ -485,6 +500,7 @@ func TestParseWrongTypes(t *testing.T) {
 	expectFailureFor(t, "cluster:{raft_lease_timeout:\"not_a_time\"}", wrongTimeErr)
 	expectFailureFor(t, "cluster:{raft_commit_timeout:123}", wrongTypeErr)
 	expectFailureFor(t, "cluster:{raft_commit_timeout:\"not_a_time\"}", wrongTimeErr)
+	expectFailureFor(t, "cluster:{allow_add_remove_node:1}", wrongTypeErr)
 	expectFailureFor(t, "sql:{driver:false}", wrongTypeErr)
 	expectFailureFor(t, "sql:{source:false}", wrongTypeErr)
 	expectFailureFor(t, "sql:{no_caching:123}", wrongTypeErr)
@@ -493,6 +509,10 @@ func TestParseWrongTypes(t *testing.T) {
 	expectFailureFor(t, "encryption_cipher: 123", wrongTypeErr)
 	expectFailureFor(t, "encryption_key: 123", wrongTypeErr)
 	expectFailureFor(t, "credentials: 123", wrongTypeErr)
+	expectFailureFor(t, "username: 123", wrongTypeErr)
+	expectFailureFor(t, "password: 123", wrongTypeErr)
+	expectFailureFor(t, "token: 123", wrongTypeErr)
+	expectFailureFor(t, "nkey_seed_file: 123", wrongTypeErr)
 }
 
 func expectFailureFor(t *testing.T, content, errorMatch string) {
