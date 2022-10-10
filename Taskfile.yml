@@ -1,0 +1,43 @@
+# github.com/go-task/task
+
+version: '3'
+
+vars:
+  BINARY_NAME: broker
+  VERSION: v1.6.1
+
+tasks:
+  default:
+    cmds:
+      - go build -buildmode=exe -o "{{.BINARY_NAME}}.exe"
+  check_update:
+    cmds:
+      - go list -u -m -json -mod=mod all | go-mod-outdated -update -direct
+  lint:
+    cmds:
+      - golangci-lint run --disable gocritic --enable misspell
+  test:
+    cmds:
+      - go test -timeout 30m ./...
+  build:
+    env:
+      GOOS: '{{OS}}'
+      GOARCH: '{{ARCH}}'
+    cmds:
+      - go mod tidy
+      - go mod vendor
+      - go build -buildmode=exe -o "{{.BINARY_NAME}}.exe" -ldflags "-X main.version={{.VERSION}}"
+  commit-modifed:
+    cmds:
+      - git add -A
+      - git commit -a -m "release {{.VERSION}}"
+      - git push origin master
+  tag:
+    cmds:
+      - git tag -a {{.VERSION}} -m {{.VERSION}}
+      - git push origin master --tags
+  release:
+    cmds:
+#      - task: lint
+      - task: commit-modifed
+      - task: tag
