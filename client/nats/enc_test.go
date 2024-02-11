@@ -1,4 +1,4 @@
-// Copyright 2012-2019 The NATS Authors
+// Copyright 2012-2022 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	. "github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/client/nats/encoders/protobuf"
 	"github.com/kubemq-io/broker/client/nats/encoders/protobuf/testdata"
 )
@@ -44,6 +45,10 @@ func TestPublishErrorAfterSubscribeDecodeError(t *testing.T) {
 	opts := options
 	nc, _ := opts.Connect()
 	defer nc.Close()
+
+	// Override default handler for test.
+	nc.SetErrorHandler(func(_ *Conn, _ *Subscription, _ error) {})
+
 	c, _ := NewEncodedConn(nc, JSON_ENCODER)
 
 	//Test message type
@@ -221,9 +226,7 @@ func TestRequest(t *testing.T) {
 	if err := c.Request("foo", &testdata.Person{Name: sentName}, response, 2*time.Second); err != nil {
 		t.Fatalf("Unable to publish: %v", err)
 	}
-	if response == nil {
-		t.Fatal("No response received")
-	} else if response.Name != recvName {
+	if response.Name != recvName {
 		t.Fatalf("Wrong response: %v instead of %v", response.Name, recvName)
 	}
 

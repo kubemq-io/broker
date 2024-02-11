@@ -103,3 +103,12 @@ Date: 10/10/22
 | nats.go               | v1.10.0  |
 | stan.go               | v0.7.0  |
 | nuid                  | v1.0.1  |
+
+### Release 1.7.0
+| Package               | Version |
+|:----------------------|:--------|
+| nats-server           | v2.1.9  |
+| nats-streaming-server | v0.19.0 |
+| nats.go               | v1.22.1 |
+| stan.go               | v0.10.4 |
+| nuid                  | v1.0.1  |

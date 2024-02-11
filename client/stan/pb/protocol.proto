@@ -100,12 +100,12 @@ message PingResponse {
 
 // Enum for start position type.
 enum StartPosition {
-  NewOnly        = 0;
-  LastReceived   = 1;
-  TimeDeltaStart = 2;
-  SequenceStart  = 3;
-  First          = 4;
-}
+    NewOnly        = 0;
+    LastReceived   = 1;
+    TimeDeltaStart = 2;
+    SequenceStart  = 3;
+    First          = 4;
+  }
 
 // Protocol for a client to subscribe
 message SubscriptionRequest {
