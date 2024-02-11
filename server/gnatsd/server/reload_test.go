@@ -36,7 +36,7 @@ import (
 
 	"github.com/nats-io/jwt/v2"
 
-	"github.com/nats-io/nats.go"
+	"github.com/kubemq-io/broker/client/nats"
 	"github.com/nats-io/nkeys"
 )
 

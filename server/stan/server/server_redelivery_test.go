@@ -16,8 +16,9 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net"
-	"strings"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -25,7 +26,9 @@ import (
 
 	"github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/client/stan"
+	"github.com/kubemq-io/broker/client/stan/pb"
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
+	"github.com/kubemq-io/broker/server/stan/stores"
 )
 
 func TestRedelivery(t *testing.T) {
@@ -112,6 +115,10 @@ func TestMultipleRedeliveries(t *testing.T) {
 	ackWait := int64(15 * time.Millisecond)
 	lowBound := int64(float64(ackWait) * 0.5)
 	highBound := int64(float64(ackWait) * 1.7)
+	// On Windows (especially Travis), be more generous
+	if runtime.GOOS == "windows" {
+		highBound = int64(35 * time.Millisecond)
+	}
 	errCh := make(chan error)
 	cb := func(m *stan.Msg) {
 		now := time.Now().UnixNano()
@@ -1097,154 +1104,6 @@ func TestIgnoreFailedHBInAckRedeliveryForQGroup(t *testing.T) {
 	}
 }
 
-type trackDeliveredMsgs struct {
-	dummyLogger
-	newSeq   int
-	redelSeq int
-	errCh    chan error
-}
-
-func (l *trackDeliveredMsgs) Tracef(format string, args ...interface{}) {
-	l.dummyLogger.Lock()
-	l.msg = fmt.Sprintf(format, args...)
-	if strings.Contains(l.msg, "Redelivering") {
-		l.redelSeq++
-	} else if strings.Contains(l.msg, "Delivering") {
-		if l.newSeq != l.redelSeq+1 {
-			l.errCh <- fmt.Errorf("Got %q while there were only %d redelivered messages", l.msg, l.redelSeq)
-		} else {
-			l.errCh <- nil
-		}
-	}
-	l.dummyLogger.Unlock()
-}
-
-func TestQueueRedeliveryOnStartup(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
-	opts := getTestDefaultOptsForPersistentStore()
-	s := runServerWithOpts(t, opts, nil)
-	defer shutdownRestartedServerOnTestExit(&s)
-
-	sc, nc := createConnectionWithNatsOpts(t, clientName, nats.ReconnectWait(100*time.Millisecond))
-	defer nc.Close()
-	defer sc.Close()
-
-	ch := make(chan bool, 1)
-	errCh := make(chan error, 4)
-	skipCh := make(chan bool, 2)
-	restarted := int32(0)
-	totalMsgs := int32(10)
-	delivered := int32(0)
-	redelivered := int32(0)
-	type qinfo struct {
-		r    int
-		msgs map[uint64]struct{}
-	}
-	newCb := func(id int) func(m *stan.Msg) {
-		q := qinfo{msgs: make(map[uint64]struct{}, 2)}
-		return func(m *stan.Msg) {
-			if !m.Redelivered {
-				if atomic.LoadInt32(&restarted) == 0 {
-					q.msgs[m.Sequence] = struct{}{}
-					if atomic.AddInt32(&delivered, 1) == totalMsgs {
-						ch <- true
-					}
-				} else {
-					m.Ack()
-					if q.r != len(q.msgs) {
-						errCh <- fmt.Errorf("Unexpected new message %v into sub %d before getting all undelivered first", m.Sequence, id)
-					}
-				}
-			} else if atomic.LoadInt32(&restarted) == 1 {
-				// This is a redelivered message after server restart
-				if _, present := q.msgs[m.Sequence]; !present {
-					errCh <- fmt.Errorf("Unexpected message %v into sub %d", m.Sequence, id)
-				} else {
-					m.Ack()
-					q.r++
-					if atomic.AddInt32(&redelivered, 1) == totalMsgs {
-						ch <- true
-					}
-				}
-			} else {
-				select {
-				case skipCh <- true:
-				default:
-				}
-				m.Sub.Unsubscribe()
-			}
-		}
-	}
-	if _, err := sc.QueueSubscribe("foo", "queue",
-		newCb(1),
-		stan.MaxInflight(int(totalMsgs/2)),
-		stan.SetManualAckMode(),
-		stan.AckWait(ackWaitInMs(500))); err != nil {
-		t.Fatalf("Unexpected error on subscribe: %v", err)
-	}
-	if _, err := sc.QueueSubscribe("foo", "queue",
-		newCb(2),
-		stan.MaxInflight(int(totalMsgs/2)),
-		stan.SetManualAckMode(),
-		stan.AckWait(ackWaitInMs(500))); err != nil {
-		t.Fatalf("Unexpected error on subscribe: %v", err)
-	}
-	// Send more messages that can be accepted, both member should stall
-	for i := 0; i < int(totalMsgs+1); i++ {
-		if err := sc.Publish("foo", []byte("msg")); err != nil {
-			t.Fatalf("Unexpected error on publish: %v", err)
-		}
-	}
-	// Wait for all messages to be received
-	select {
-	case <-ch:
-	case <-skipCh:
-		// If we have a redelivery before the server restart
-		// (can happen on Travis because of timing), no point
-		// in continuing this test.
-		return
-	case <-time.After(5 * time.Second):
-		t.Fatal("Did not receive all our messages")
-	default:
-	}
-	// Now stop server and wait more than AckWait before resarting.
-	s.Shutdown()
-	// We need to make sure that the first redelivery on startup will
-	// actually send messages to original qsub. This happens only if
-	// the AckWait has elapsed. So make sure that we wait long enough.
-	time.Sleep(time.Second)
-	l := &trackDeliveredMsgs{newSeq: int(totalMsgs + 1), errCh: make(chan error, 1)}
-	opts.Trace = true
-	opts.CustomLogger = l
-	atomic.StoreInt32(&restarted, 1)
-	s = runServerWithOpts(t, opts, nil)
-	// Check that messages are delivered to members that
-	// originally got them. Wait for all messages to be redelivered
-	select {
-	case e := <-errCh:
-		t.Fatalf(e.Error())
-	case <-ch:
-	// All messages were redelivered, we are ok
-	case <-skipCh:
-		// If we have a redelivery before the server restart
-		// (can happen on Travis because of timing), no point
-		// in continuing this test.
-		return
-	case <-time.After(time.Second):
-		t.Fatal("Did not get all redelivered messages")
-	}
-	// Check that we find in log that all messages were redelivered before
-	// the new message was delivered.
-	select {
-	case e := <-l.errCh:
-		if e != nil {
-			t.Fatalf(e.Error())
-		}
-	case <-time.After(250 * time.Millisecond):
-	}
-}
-
 type delayReconnectDialer struct {
 	fail int
 }
@@ -1740,5 +1599,151 @@ func TestPersistentStoreRedeliveryCount(t *testing.T) {
 	case <-ch:
 	case <-time.After(time.Second):
 		t.Fatalf("Timedout")
+	}
+
+	// Make sure that deliver count map gets cleaned-up once messages are acknowledged.
+	sub := s.clients.getSubs(clientName)[0]
+	waitForCount(t, 0, func() (string, int) {
+		sub.RLock()
+		l := len(sub.rdlvCount)
+		sub.RUnlock()
+		return "redelivery map size", l
+	})
+}
+
+type testRdlvRaceWithAck struct {
+	stores.MsgStore
+	sync.Mutex
+	block bool
+	ch    chan struct{}
+	dch   chan struct{}
+}
+
+func (ms *testRdlvRaceWithAck) Lookup(seq uint64) (*pb.MsgProto, error) {
+	ms.Lock()
+	block := ms.block
+	ch := ms.ch
+	dch := ms.dch
+	ms.Unlock()
+	if block {
+		ch <- struct{}{}
+		<-dch
+	}
+	return ms.MsgStore.Lookup(seq)
+}
+
+func TestRedeliveryRaceWithAck(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		queue string
+	}{
+		{"plain", ""},
+		{"queue", "queue"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := runServer(t, clusterName)
+			defer s.Shutdown()
+
+			c, err := s.lookupOrCreateChannel("foo")
+			if err != nil {
+				t.Fatalf("Error on lookup: %v", err)
+			}
+			ms := &testRdlvRaceWithAck{
+				MsgStore: c.store.Msgs,
+				ch:       make(chan struct{}, 1),
+				dch:      make(chan struct{}),
+			}
+			s.clients.Lock()
+			c.store.Msgs = ms
+			s.clients.Unlock()
+
+			sc := NewDefaultConnection(t)
+			defer sc.Close()
+
+			msgCh := make(chan *stan.Msg, 10)
+			if _, err := sc.QueueSubscribe("foo", test.queue, func(m *stan.Msg) {
+				msgCh <- m
+			}, stan.SetManualAckMode(), stan.AckWait(ackWaitInMs(250))); err != nil {
+				t.Fatalf("Error on subscribe: %v", err)
+			}
+
+			sc.Publish("foo", []byte("msg"))
+
+			var m *stan.Msg
+			select {
+			case m = <-msgCh:
+			case <-time.After(time.Second):
+				t.Fatalf("Did not get the message")
+			}
+			ms.Lock()
+			ms.block = true
+			ch := ms.ch
+			dch := ms.dch
+			ms.Unlock()
+
+			select {
+			case <-ch:
+				m.Ack()
+				sub := c.ss.getAllSubs()[0]
+				waitFor(t, time.Second, 15*time.Millisecond, func() error {
+					if test.queue != "" {
+						sub.qstate.RLock()
+					}
+					sub.RLock()
+					done := len(sub.acksPending) == 0
+					sub.RUnlock()
+					if test.queue != "" {
+						sub.qstate.RUnlock()
+					}
+					if !done {
+						return fmt.Errorf("message still pending")
+					}
+					return nil
+				})
+				close(dch)
+			case <-time.After(time.Second):
+				t.Fatalf("Lookup not invoked for redelivery")
+			}
+
+			select {
+			case m := <-msgCh:
+				t.Fatalf("Should not have received redelivered message: %+v", m)
+			case <-time.After(250 * time.Millisecond):
+				// OK
+			}
+		})
+	}
+
+}
+
+func TestNoPanicOnSubCloseWhileOnRedelivery(t *testing.T) {
+	s := runServer(t, clusterName)
+	defer s.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	if err := sc.Publish("foo", []byte("msg")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+
+	for i := 0; i < 100; i++ {
+		sub, err := sc.Subscribe("foo", func(_ *stan.Msg) {},
+			stan.AckWait(ackWaitInMs(5)),
+			stan.SetManualAckMode(),
+			stan.DeliverAllAvailable())
+		if err != nil {
+			t.Fatalf("Error on subscribe: %v", err)
+		}
+		// Artificially pretend that the client had failed hearbeat
+		srvSub := s.clients.getSubs(clientName)[0]
+		srvSub.Lock()
+		srvSub.hasFailedHB = true
+		srvSub.Unlock()
+
+		time.Sleep(time.Duration(rand.Intn(15)) * time.Millisecond)
+		sub.Close()
+
+		waitForNumSubs(t, s, clientName, 0)
 	}
 }

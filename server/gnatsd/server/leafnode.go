@@ -754,7 +754,7 @@ func (s *Server) createLeafNode(conn net.Conn, remote *leafNodeCfg) *client {
 				// If we overrode and used the saved tlsName but that failed
 				// we will clear that here. This is for the case that another server
 				// does not have the same tlsName, maybe only IPs.
-				// https://github.com/nats-io/nats-server/issues/1256
+				// https://github.com/kubemq-io/broker/server/gnatsd/issues/1256
 				if _, ok := err.(x509.HostnameError); ok {
 					remote.Lock()
 					if host == remote.tlsName {

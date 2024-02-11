@@ -336,6 +336,9 @@ func TestFTPartition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error on subscribe: %v", err)
 	}
+	if err := syncNC.Flush(); err != nil {
+		t.Fatalf("Error on flush: %v", err)
+	}
 
 	// Start NATS server independently
 	ns := natsdTest.RunServer(&nOpts)
@@ -363,12 +366,15 @@ func TestFTPartition(t *testing.T) {
 				"-test.v",
 				"-test.run=TestFTPartition$",
 				"-persistent_store", persistentStoreType,
+				"-sql_create_db=false",
+				"-sql_delete_db=false",
+			}
+			if !doSQL {
+				params = append(params, "-sql=false")
 			}
 			// Start a process that will be the standby
 			if persistentStoreType == stores.TypeSQL {
 				params = append(params,
-					"-sql_create_db=false",
-					"-sql_delete_db=false",
 					"-sql_driver", testSQLDriver,
 					"-sql_source", testSQLSource,
 					"-sql_source_admin", testSQLSourceAdmin,
@@ -482,12 +488,15 @@ func TestFTPartitionReversed(t *testing.T) {
 				"-test.v",
 				"-test.run=TestFTPartitionReversed$",
 				"-persistent_store", persistentStoreType,
+				"-sql_create_db=false",
+				"-sql_delete_db=false",
+			}
+			if !doSQL {
+				params = append(params, "-sql=false")
 			}
 			// Start a process that will act as the active server
 			if persistentStoreType == stores.TypeSQL {
 				params = append(params,
-					"-sql_create_db=false",
-					"-sql_delete_db=false",
 					"-sql_driver", testSQLDriver,
 					"-sql_source", testSQLSource,
 					"-sql_source_admin", testSQLSourceAdmin,

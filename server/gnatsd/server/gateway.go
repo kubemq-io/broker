@@ -790,7 +790,7 @@ func (s *Server) createGateway(cfg *gatewayCfg, url *url.URL, conn net.Conn) {
 		if err := conn.Handshake(); err != nil {
 			if solicit {
 				// Based on type of error, possibly clear the saved tlsName
-				// See: https://github.com/nats-io/nats-server/issues/1256
+				// See: https://github.com/kubemq-io/broker/server/gnatsd/issues/1256
 				if _, ok := err.(x509.HostnameError); ok {
 					cfg.Lock()
 					if host == cfg.tlsName {

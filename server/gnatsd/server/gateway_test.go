@@ -29,8 +29,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/server/gnatsd/logger"
-	"github.com/nats-io/nats.go"
 )
 
 func init() {

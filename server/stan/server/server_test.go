@@ -1,4 +1,4 @@
-// Copyright 2016-2019 The NATS Authors
+// Copyright 2016-2021 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,7 +17,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"regexp"
@@ -32,12 +31,12 @@ import (
 	"github.com/kubemq-io/broker/client/nats"
 	"github.com/kubemq-io/broker/client/stan"
 	"github.com/kubemq-io/broker/client/stan/pb"
-	"github.com/kubemq-io/broker/pkg/nuid"
 	natsd "github.com/kubemq-io/broker/server/gnatsd/server"
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
 	"github.com/kubemq-io/broker/server/stan/logger"
 	"github.com/kubemq-io/broker/server/stan/stores"
 	"github.com/kubemq-io/broker/server/stan/test"
+	"github.com/nats-io/nuid"
 
 	_ "github.com/go-sql-driver/mysql"                             // mysql driver
 	_ "github.com/kubemq-io/broker/server/stan/stores/pqdeadlines" // wrapper for postgres that gives read/write deadlines
@@ -84,7 +83,7 @@ var (
 	testSQLSource       = testDefaultMySQLSource
 	testSQLSourceAdmin  = testDefaultMySQLSourceAdmin
 	testSQLDatabaseName = testDefaultDatabaseName
-	testDBSuffixes      = []string{"", "_a", "_b", "_c"}
+	testDBSuffixes      = []string{"", "_a", "_b", "_c", "_d", "_e"}
 	doSQL               = false
 )
 
@@ -97,9 +96,7 @@ func TestMain(m *testing.M) {
 	)
 	flag.StringVar(&bst, "bench_store", "", "store type for bench tests (mem, file)")
 	flag.StringVar(&pst, "persistent_store", "", "store type for server recovery related tests (file)")
-	// This one is added here so that if we want to disable sql for stores tests
-	// we can use the same param for all packages as in "go test -v ./... -sql=false"
-	flag.Bool("sql", false, "Not used for server tests")
+	flag.BoolVar(&doSQL, "sql", true, "Enable/disable SQL tests in server package")
 	// Those 2 sql related flags are handled here, not in AddSQLFlags
 	flag.BoolVar(&sqlCreateDb, "sql_create_db", true, "create sql database on startup")
 	flag.BoolVar(&sqlDeleteDb, "sql_delete_db", true, "delete sql database on exit")
@@ -131,7 +128,7 @@ func TestMain(m *testing.M) {
 
 	// If either (or both) bench or tests select an SQL store, we need to do
 	// so initializing and cleaning at the end of the test.
-	doSQL = benchStoreType == stores.TypeSQL || persistentStoreType == stores.TypeSQL
+	doSQL = doSQL || benchStoreType == stores.TypeSQL || persistentStoreType == stores.TypeSQL
 
 	if doSQL {
 		defaultSources := make(map[string][]string)
@@ -164,7 +161,7 @@ func TestMain(m *testing.M) {
 }
 
 func init() {
-	tmpDir, err := ioutil.TempDir(".", "data_server_")
+	tmpDir, err := os.MkdirTemp(".", "data_server_")
 	if err != nil {
 		panic("Could not create tmp dir")
 	}
@@ -411,13 +408,13 @@ func createConnectionWithNatsOpts(t tLogger, clientName string,
 
 func createConfFile(t *testing.T, content []byte) string {
 	t.Helper()
-	conf, err := ioutil.TempFile("", "")
+	conf, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Error creating conf file: %v", err)
 	}
 	fName := conf.Name()
 	conf.Close()
-	if err := ioutil.WriteFile(fName, content, 0666); err != nil {
+	if err := os.WriteFile(fName, content, 0666); err != nil {
 		os.Remove(fName)
 		t.Fatalf("Error writing conf file: %v", err)
 	}
@@ -426,7 +423,7 @@ func createConfFile(t *testing.T, content []byte) string {
 
 func changeCurrentConfigContentWithNewContent(t *testing.T, curConfig string, content []byte) {
 	t.Helper()
-	if err := ioutil.WriteFile(curConfig, content, 0666); err != nil {
+	if err := os.WriteFile(curConfig, content, 0666); err != nil {
 		t.Fatalf("Error writing config: %v", err)
 	}
 }
@@ -1005,20 +1002,24 @@ func TestProtocolOrder(t *testing.T) {
 
 			// Mix pub and subscribe calls
 			ch = make(chan bool)
-			errCh = make(chan error)
+			errCh = make(chan error, 1)
 			startSubAt := 50
 			var sub stan.Subscription
 			var err error
+			first := true
 			for i := 1; i <= 100; i++ {
 				if err := sc.Publish("foo", []byte("hello")); err != nil {
 					t.Fatalf("Unexpected error on publish: %v", err)
 				}
 				if i == startSubAt {
 					sub, err = sc.Subscribe("foo", func(m *stan.Msg) {
-						if m.Sequence == uint64(startSubAt)+1 {
-							ch <- true
-						} else if len(errCh) == 0 {
-							errCh <- fmt.Errorf("Received message %v instead of %v", m.Sequence, startSubAt+1)
+						if first {
+							if m.Sequence == uint64(startSubAt)+1 {
+								ch <- true
+							} else {
+								errCh <- fmt.Errorf("Received message %v instead of %v", m.Sequence, startSubAt+1)
+							}
+							first = false
 						}
 					})
 					if err != nil {
@@ -1037,6 +1038,7 @@ func TestProtocolOrder(t *testing.T) {
 			sub.Unsubscribe()
 
 			// Acks should be processed before Connection close
+			errCh = make(chan error, 1)
 			for i := 0; i < total; i++ {
 				rcv := int32(0)
 				sc2, err := stan.Connect(clusterName, "otherclient")
@@ -1609,6 +1611,9 @@ SUAKYRHVIOREXV7EUZTBHUHL7NUMHPMAS7QMDU3GTIUWEI5LDNOXD43IZY
 }
 
 func TestFileSliceMaxBytesCmdLine(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	noPrint := func() {}
 	sopts, nopts, err := ConfigureOptions(fs, []string{"-store", "file", "-dir", defaultDataStore, "-file_slice_max_bytes", "0"}, noPrint, noPrint, noPrint)
@@ -1623,5 +1628,223 @@ func TestFileSliceMaxBytesCmdLine(t *testing.T) {
 	s.mu.Unlock()
 	if smb != 0 {
 		t.Fatalf("Expected value to be 0, got %v", smb)
+	}
+}
+
+func TestInternalSubsLimits(t *testing.T) {
+	setPartitionsVarsForTest()
+	defer resetDefaultPartitionsVars()
+
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	for _, test := range []struct {
+		name string
+		opts func() *Options
+	}{
+		{"regular", func() *Options { return GetDefaultOptions() }},
+		{"partition", func() *Options {
+			o := GetDefaultOptions()
+			o.Partitioning = true
+			o.AddPerChannel("foo", &stores.ChannelLimits{})
+			o.AddPerChannel("bar", &stores.ChannelLimits{})
+			return o
+		}},
+		{"ft", func() *Options { return getTestFTDefaultOptions() }},
+		{"clustered", func() *Options { return getTestDefaultOptsForClustering("a", true) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.name == "clustered" {
+				ns := natsdTest.RunDefaultServer()
+				defer ns.Shutdown()
+			}
+			o := test.opts()
+			s := runServerWithOpts(t, o, nil)
+			defer s.Shutdown()
+
+			switch test.name {
+			case "clustered":
+				getLeader(t, time.Second, s)
+			case "ft":
+				getFTActiveServer(t, s)
+			default:
+			}
+
+			s.mu.Lock()
+			defer s.mu.Unlock()
+
+			subs := []*nats.Subscription{
+				s.connectSub,
+				s.pubSub,
+				s.subUnsubSub,
+				s.subCloseSub,
+				s.closeSub,
+				s.cliPingSub,
+				s.addNodeSub,
+				s.rmNodeSub,
+			}
+			for _, sub := range subs {
+				// sub can be nil depending on the running mode.
+				if sub == nil {
+					continue
+				}
+				if count, sz, err := sub.PendingLimits(); err != nil || count != -1 || sz != -1 {
+					t.Fatalf("Unexpected values for sub on %q: err=%v count=%v sz=%v",
+						sub.Subject, err, count, sz)
+				}
+			}
+			// The subscription on "client subscription requests" should not be unlimited.
+			if count, sz, err := s.subSub.PendingLimits(); err != nil || count == -1 || sz == -1 {
+				t.Fatalf("The subSub subscription should not be unlimited: err=%v count=%v sz=%v", err, count, sz)
+			}
+		})
+	}
+}
+
+func TestChannelNameRejectedIfAlreadyExistsWithDifferentCase(t *testing.T) {
+	for _, tinfo := range []struct {
+		name    string
+		st      string
+		restart bool
+	}{
+		{"memory", stores.TypeMemory, false},
+		{"file", stores.TypeFile, true},
+		{"sql", stores.TypeSQL, true},
+		{"clustered", stores.TypeFile, true},
+	} {
+		t.Run(tinfo.name, func(t *testing.T) {
+			var o *Options
+			if tinfo.st == stores.TypeSQL {
+				if !doSQL {
+					t.SkipNow()
+				}
+			}
+			// Force persistent store to be the tinfo.st for this test.
+			orgps := persistentStoreType
+			persistentStoreType = tinfo.st
+			defer func() { persistentStoreType = orgps }()
+
+			if tinfo.st == stores.TypeSQL || tinfo.st == stores.TypeFile {
+				o = getTestDefaultOptsForPersistentStore()
+			} else if tinfo.st == stores.TypeMemory {
+				o = GetDefaultOptions()
+			}
+
+			cleanupDatastore(t)
+			defer cleanupDatastore(t)
+			cleanupRaftLog(t)
+			defer cleanupRaftLog(t)
+
+			var servers []*StanServer
+			if tinfo.name == "clustered" {
+				ns := natsdTest.RunDefaultServer()
+				defer ns.Shutdown()
+
+				o1 := getTestDefaultOptsForClustering("a", true)
+				servers = append(servers, runServerWithOpts(t, o1, nil))
+				o2 := getTestDefaultOptsForClustering("b", false)
+				servers = append(servers, runServerWithOpts(t, o2, nil))
+				o3 := getTestDefaultOptsForClustering("c", false)
+				servers = append(servers, runServerWithOpts(t, o3, nil))
+			} else {
+				servers = append(servers, runServerWithOpts(t, o, nil))
+			}
+			for _, s := range servers {
+				defer s.Shutdown()
+			}
+
+			sc := NewDefaultConnection(t)
+			defer sc.Close()
+
+			sendOK := func(channel, content string) {
+				t.Helper()
+				if err := sc.Publish(channel, []byte(content)); err != nil {
+					t.Fatalf("Error on send: %v", err)
+				}
+			}
+			sendFail := func(channel, content string) {
+				t.Helper()
+				err := sc.Publish(channel, []byte(content))
+				if err == nil || !strings.Contains(err.Error(), "exists") {
+					t.Fatalf("Expected error that channel already exists, got: %v", err)
+				}
+			}
+			sendOK("Foo", "1")
+			sendOK("Foo", "2")
+			sendOK("Foo", "3")
+			sendOK("Foo", "4")
+			// Change channel name case
+			sendFail("foo", "1")
+			sendFail("foo", "2")
+			// Back to "Foo"
+			sendOK("Foo", "5")
+			sendOK("Foo", "6")
+
+			recvOK := func(channel string) {
+				t.Helper()
+
+				ch := make(chan *stan.Msg, 6)
+				sub, err := sc.Subscribe(channel, func(m *stan.Msg) {
+					ch <- m
+				}, stan.DeliverAllAvailable())
+				if err != nil {
+					t.Fatalf("Error on subscribe: %v", err)
+				}
+				defer sub.Unsubscribe()
+
+				// We want to get all 6 messages
+				for i := 0; i < 6; i++ {
+					select {
+					case m := <-ch:
+						if v, err := strconv.ParseInt(string(m.Data), 10, 64); err != nil || int(v) != i+1 {
+							t.Fatalf("Invalid message %v: %s", i+1, m.Data)
+						}
+					case <-time.After(time.Second):
+						t.Fatalf("Failed receiving message %v", i+1)
+					}
+				}
+			}
+			recvFail := func(channel string) {
+				t.Helper()
+
+				_, err := sc.Subscribe(channel, func(m *stan.Msg) {}, stan.DeliverAllAvailable())
+				if err == nil || !strings.Contains(err.Error(), "exists") {
+					t.Fatalf("Expected error that channel already exists, got %v", err)
+				}
+			}
+			recvOK("Foo")
+			recvFail("foo")
+			recvFail("FoO")
+
+			if !tinfo.restart {
+				return
+			}
+
+			sc.Close()
+
+			for i, s := range servers {
+				s.Shutdown()
+				s.mu.RLock()
+				opts := s.opts
+				s.mu.RUnlock()
+				s = runServerWithOpts(t, opts, nil)
+				defer s.Shutdown()
+				servers[i] = s
+			}
+
+			if tinfo.name == "clustered" {
+				getLeader(t, 10*time.Second, servers...)
+			}
+
+			sc = NewDefaultConnection(t)
+			defer sc.Close()
+
+			// Try to receive again, but change the order...
+			recvFail("foo")
+			recvOK("Foo")
+			recvFail("FoO")
+		})
 	}
 }

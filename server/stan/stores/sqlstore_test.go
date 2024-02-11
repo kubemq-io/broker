@@ -160,8 +160,9 @@ func TestSQLAllOptions(t *testing.T) {
 	defer cleanupSQLDatastore(t)
 
 	opts := &SQLStoreOptions{
-		NoCaching:    true,
-		MaxOpenConns: 123,
+		NoCaching:       true,
+		MaxOpenConns:    123,
+		BulkInsertLimit: 456,
 	}
 	s, err := NewSQLStore(testLogger, testSQLDriver, testSQLSource, nil, SQLAllOptions(opts))
 	if err != nil {
@@ -177,6 +178,9 @@ func TestSQLAllOptions(t *testing.T) {
 	}
 	if so.MaxOpenConns != 123 {
 		t.Fatalf("MaxOpenConns should be 123, got %v", so.MaxOpenConns)
+	}
+	if so.BulkInsertLimit != 456 {
+		t.Fatalf("BulkInsertLimit should be 456, got %v", so.BulkInsertLimit)
 	}
 }
 
@@ -2138,5 +2142,178 @@ func TestSQLMaxAgeForMsgsWithTimestampInPast(t *testing.T) {
 		if first, err := cs.Msgs.FirstSequence(); err != nil || first != seq+1 {
 			t.Fatal("Message should have expired")
 		}
+	}
+}
+
+func TestSQLBulkInsertLimit(t *testing.T) {
+	if !doSQL {
+		t.SkipNow()
+	}
+
+	cleanupSQLDatastore(t)
+	defer cleanupSQLDatastore(t)
+
+	// Create store with caching enabled and bulk insert limit
+	s, err := NewSQLStore(testLogger, testSQLDriver, testSQLSource, nil,
+		SQLNoCaching(false), SQLBulkInsertLimit(10))
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer s.Close()
+
+	cs := storeCreateChannel(t, s, "foo")
+	for seq := uint64(1); seq < 127; seq++ {
+		msg := &pb.MsgProto{
+			Sequence:  seq,
+			Subject:   "foo",
+			Data:      []byte(fmt.Sprintf("%v", seq)),
+			Timestamp: time.Now().UnixNano(),
+		}
+		if _, err := cs.Msgs.Store(msg); err != nil {
+			t.Fatalf("Error storing message: %v", err)
+		}
+	}
+	if err := cs.Msgs.Flush(); err != nil {
+		t.Fatalf("Error on flush: %v", err)
+	}
+	for seq := uint64(127); seq < 135; seq++ {
+		msg := &pb.MsgProto{
+			Sequence:  seq,
+			Subject:   "foo",
+			Data:      []byte(fmt.Sprintf("%v", seq)),
+			Timestamp: time.Now().UnixNano(),
+		}
+		if _, err := cs.Msgs.Store(msg); err != nil {
+			t.Fatalf("Error storing message: %v", err)
+		}
+	}
+	if err := cs.Msgs.Flush(); err != nil {
+		t.Fatalf("Error on flush: %v", err)
+	}
+
+	msg := &pb.MsgProto{
+		Sequence:  135,
+		Subject:   "foo",
+		Data:      []byte(fmt.Sprintf("%v", 135)),
+		Timestamp: time.Now().UnixNano(),
+	}
+	if _, err := cs.Msgs.Store(msg); err != nil {
+		t.Fatalf("Error storing message: %v", err)
+	}
+	if err := cs.Msgs.Flush(); err != nil {
+		t.Fatalf("Error on flush: %v", err)
+	}
+
+	for seq := uint64(1); seq < 136; seq++ {
+		m := msgStoreLookup(t, cs.Msgs, seq)
+		expected := fmt.Sprintf("%v", seq)
+		if string(m.Data) != expected {
+			t.Fatalf("Expected %q, got %q", expected, m.Data)
+		}
+	}
+}
+
+func TestSQLStoreMaxSeqWithExpiredMsgs(t *testing.T) {
+	if !doSQL {
+		t.SkipNow()
+	}
+
+	cleanupSQLDatastore(t)
+	defer cleanupSQLDatastore(t)
+
+	// Create store with caching enabled
+	limits := testDefaultStoreLimits
+	limits.MaxAge = 250 * time.Millisecond
+	s, err := NewSQLStore(testLogger, testSQLDriver, testSQLSource, &limits, SQLNoCaching(false))
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer s.Close()
+
+	info := testDefaultServerInfo
+	if err := s.Init(&info); err != nil {
+		t.Fatalf("Error on init: %v", err)
+	}
+
+	cs := storeCreateChannel(t, s, "foo")
+
+	sub := spb.SubState{
+		ClientID:      "me",
+		AckWaitInSecs: 30,
+		IsDurable:     true,
+		MaxInFlight:   1024,
+		QGroup:        "dur:queue",
+		Inbox:         "my.inbox",
+		AckInbox:      "ack.inbox",
+	}
+	if err := cs.Subs.CreateSub(&sub); err != nil {
+		t.Fatalf("Error creating sub: %v", err)
+	}
+
+	for seq := uint64(1); seq <= 100; seq++ {
+		msg := &pb.MsgProto{
+			Sequence:  seq,
+			Subject:   "foo",
+			Data:      []byte(fmt.Sprintf("%v", seq)),
+			Timestamp: time.Now().UnixNano(),
+		}
+		if _, err := cs.Msgs.Store(msg); err != nil {
+			t.Fatalf("Error storing message: %v", err)
+		}
+	}
+	if err := cs.Msgs.Flush(); err != nil {
+		t.Fatalf("Error on flush: %v", err)
+	}
+
+	for seq := uint64(1); seq <= 100; seq++ {
+		cs.Subs.AddSeqPending(sub.ID, seq)
+	}
+	for seq := uint64(1); seq <= 98; seq++ {
+		cs.Subs.AckSeqPending(sub.ID, seq)
+	}
+	sub.IsClosed = true
+	cs.Subs.UpdateSub(&sub)
+	cs.Subs.Flush()
+
+	s.Close()
+
+	// Wait for more than max age
+	time.Sleep(500 * time.Millisecond)
+
+	for i := 0; i < 2; i++ {
+		s, err = NewSQLStore(testLogger, testSQLDriver, testSQLSource, &limits, SQLNoCaching(false))
+		if err != nil {
+			t.Fatalf("Error creating store: %v", err)
+		}
+		defer s.Close()
+
+		// Recover state
+		rs, err := s.Recover()
+		if err != nil {
+			t.Fatalf("Error on recovery: %v", err)
+		}
+		c, ok := rs.Channels["foo"]
+		if !ok {
+			t.Fatal("Did not recover channel foo")
+		}
+		cs = c.Channel
+		if i > 0 {
+			first, last, err := cs.Msgs.FirstAndLastSequence()
+			if err != nil {
+				t.Fatalf("Error getting first/last seq: %v", err)
+			}
+			if first != 101 && last != 100 {
+				t.Fatalf("Unexpected first/last sequence: %v/%v", first, last)
+			}
+
+			if l := len(c.Subscriptions); l != 1 {
+				t.Fatalf("Expected 1 sub, got %v", l)
+			}
+			ts := c.Subscriptions[0]
+			if ts.Sub.LastSent != 100 {
+				t.Fatalf("Unexpected sub's LastSent: %v", ts.Sub.LastSent)
+			}
+		}
+		s.Close()
 	}
 }

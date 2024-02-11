@@ -1,4 +1,4 @@
-// Copyright 2017-2020 The NATS Authors
+// Copyright 2017-2022 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,9 +51,13 @@ var (
 	tportTimeout                = defaultTPortTimeout
 )
 
+const (
+	testLazyReplicationInterval = 250 * time.Millisecond
+)
+
 func clusterSetupForTest() {
 	runningInTests = true
-	lazyReplicationInterval = 250 * time.Millisecond
+	lazyReplicationInterval = testLazyReplicationInterval
 	joinRaftGroupTimeout = 250 * time.Millisecond
 	tportTimeout = 250 * time.Millisecond
 }
@@ -69,6 +74,20 @@ type ClusteringOptions struct {
 	TrailingLogs int64    // Number of logs left after a snapshot.
 	Sync         bool     // Do a file sync after every write to the Raft log and message store.
 	RaftLogging  bool     // Enable logging of Raft library (disabled by default since really verbose).
+
+	// Enable creation of dedicated NATS connections to communicate with other
+	// nodes. Normally, the server has a single NATS connection and subscribes
+	// to a subject where other nodes can submit requests to "connect" to it.
+	// When a remote connects, a new subscription on an inbox is created on
+	// both sides and they use their single "raft" NATS connection to communicate.
+	// If node "A" connects to both "B" and "C" it will have two subscriptions
+	// and two "outbox" subjects (on per remote node) to which send data to.
+	//
+	// With this option enabled, NATS connection(s) will be created per remote
+	// node. This should help with performance and reduce contention.
+	// The RAFT transport is pooling connections, so there may be more than
+	// one connection per remote node.
+	NodesConnections bool
 
 	// If this is enabled, the leader of the cluster will listen to add/remove
 	// requests on NATS subject "_STAN.raft.<cluster ID>.node.[add|remove]".
@@ -89,6 +108,20 @@ type ClusteringOptions struct {
 	RaftElectionTimeout  time.Duration
 	RaftLeaseTimeout     time.Duration
 	RaftCommitTimeout    time.Duration
+
+	// These options influence the RAFT store implementation which uses bolt DB.
+	//
+	// Sync freelist to disk. This reduces the database write performance, but
+	// speed up recovery since there is no need for a full database re-sync.
+	BoltFreeListSync bool
+
+	// BoltFreeListMap sets the backend freelist type to use a map instead of
+	// the default array type.
+	// The "array" type (the default) is simple but suffers dramatic performance
+	// degradation if database is large and framentation in freelist is common.
+	// The "hashmap which is faster in almost all circumstances but doesn't guarantee
+	// that it offers the smallest page id available. In normal case it is safe.
+	BoltFreeListMap bool
 }
 
 // raftNode is a handle to a member in a Raft consensus group.
@@ -186,7 +219,13 @@ func (s *StanServer) createServerRaftNode(hasStreamingState bool) error {
 		for i := 0; i < 5; i++ {
 			r, err := s.ncr.Request(fmt.Sprintf("%s.%s.join", defaultRaftPrefix, name), req, joinRaftGroupTimeout)
 			if err != nil {
-				time.Sleep(20 * time.Millisecond)
+				waitTime := 20 * time.Millisecond
+				if err == nats.ErrNoResponders {
+					// wait the equivalent of the Request() timeout, so that our
+					// loop does not fail too fast.
+					waitTime += joinRaftGroupTimeout
+				}
+				time.Sleep(waitTime)
 				continue
 			}
 			if err := resp.Unmarshal(r.Data); err != nil {
@@ -304,12 +343,10 @@ func (s *StanServer) createRaftNode(name string) (bool, error) {
 	s.raft = &raftNode{}
 
 	raftLogFileName := filepath.Join(path, raftLogFile)
-	store, err := newRaftLog(s.log, raftLogFileName, s.opts.Clustering.Sync, int(s.opts.Clustering.TrailingLogs),
-		s.opts.Encrypt, s.opts.EncryptionCipher, s.opts.EncryptionKey)
+	store, err := newRaftLog(s.log, raftLogFileName, s.opts)
 	if err != nil {
 		return false, err
 	}
-	store.setCacheSize(s.opts.Clustering.LogCacheSize)
 
 	// Go through the list of channels that we have recovered from streaming store
 	// and set their corresponding UID.
@@ -366,8 +403,11 @@ func (s *StanServer) createRaftNode(name string) (bool, error) {
 		return false, err
 	}
 
-	// TODO: using a single NATS conn for every channel might be a bottleneck. Maybe pool conns?
-	transport, err := newNATSTransport(addr, s.ncr, tportTimeout, logWriter)
+	var makeConn natsRaftConnCreator
+	if s.opts.Clustering.NodesConnections {
+		makeConn = s.createNewRaftNATSConn
+	}
+	transport, err := newNATSTransport(addr, s.ncr, tportTimeout, logWriter, makeConn)
 	if err != nil {
 		store.Close()
 		return false, err
@@ -376,7 +416,9 @@ func (s *StanServer) createRaftNode(name string) (bool, error) {
 	transport.TimeoutScale = 1
 
 	// Set up a channel for reliable leader notifications.
-	raftNotifyCh := make(chan bool, 1)
+	// Make the buffer big enough so that we can sustain leader flapping while still
+	// inside the leadershipAcquired() function.
+	raftNotifyCh := make(chan bool, 64)
 	config.NotifyCh = raftNotifyCh
 
 	fsm := &raftFSM{server: s}
@@ -460,6 +502,13 @@ func (s *StanServer) createRaftNode(name string) (bool, error) {
 	return existingState, nil
 }
 
+func (s *StanServer) createNewRaftNATSConn(name string) (*nats.Conn, error) {
+	remoteNodeID := strings.TrimPrefix(name, s.opts.ID+".")
+	remoteNodeID = strings.TrimSuffix(remoteNodeID, "."+s.opts.ID)
+	conn, err := s.createNatsClientConn(s.opts.Clustering.NodeID + "-to-" + remoteNodeID)
+	return conn, err
+}
+
 // bootstrapCluster bootstraps the node for the provided Raft group either as a
 // seed node or with the given peer configuration, depending on configuration
 // and with the latter taking precedence.
@@ -489,10 +538,16 @@ func (s *StanServer) bootstrapCluster(name string, node *raft.Raft) error {
 	return node.BootstrapCluster(config).Error()
 }
 
+// This is bad because we have something like: "test-cluster.a.test-cluster",
+// unfortunately, we can't change now without breaking backward compatibility,
+// because new/old servers would not be able to connect to each other, since
+// this is used for the subscription's subject to accept/send requests between
+// nodes.
 func (s *StanServer) getClusteringAddr(raftName string) string {
 	return s.getClusteringPeerAddr(raftName, s.opts.Clustering.NodeID)
 }
 
+// See comment above...
 func (s *StanServer) getClusteringPeerAddr(raftName, nodeID string) string {
 	return fmt.Sprintf("%s.%s.%s", s.opts.ID, nodeID, raftName)
 }
@@ -531,7 +586,7 @@ func (r *raftFSM) Apply(l *raft.Log) interface{} {
 	s := r.server
 	op := &spb.RaftOperation{}
 	if err := op.Unmarshal(l.Data); err != nil {
-		panic(err)
+		return fmt.Errorf("unable to unmarshal RaftOperation: %v", err)
 	}
 	// We don't want snapshot Persist() and Apply() to execute concurrently,
 	// so use common lock.
@@ -597,10 +652,15 @@ func (r *raftFSM) Apply(l *raft.Log) interface{} {
 	case spb.RaftOperation_RemoveSubscription:
 		fallthrough
 	case spb.RaftOperation_CloseSubscription:
+		c, sub := s.getChannelAndSubForSubCloseOrUnsub(op.Unsub)
+		// Could be that the channel has been removed due to inactivity, etc..
+		if c == nil || sub == nil {
+			return nil
+		}
 		// Close/Unsub subscription replication.
 		isSubClose := op.OpType == spb.RaftOperation_CloseSubscription
 		s.closeMu.Lock()
-		err := s.unsubscribe(op.Unsub, isSubClose)
+		err := s.unsubscribeSub(c, op.Unsub.ClientID, sub, isSubClose, true)
 		s.closeMu.Unlock()
 		return err
 	case spb.RaftOperation_SendAndAck:
@@ -680,6 +740,7 @@ func (r *raftFSM) lookupOrCreateChannel(name string, id uint64) (*channel, error
 			return nil, err
 		}
 		delete(cs.channels, name)
+		delete(s.channels.channelsLC, strings.ToLower(name))
 	}
 	// Channel does exist or has been deleted. Create now with given ID.
 	return cs.createChannelLocked(s, name, id)

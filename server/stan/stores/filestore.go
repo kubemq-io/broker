@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -740,9 +739,9 @@ func checkFileVersion(r io.Reader) error {
 
 // writeRecord writes a record to `w`.
 // The record layout is as follows:
-// 8 bytes: 4 bytes for type and/or size combined
-//
-//	4 bytes for CRC-32
+// 8 bytes:
+// - 4 bytes for type and/or size combined
+// - 4 bytes for CRC-32
 //
 // variable bytes: payload.
 // If a buffer is provided, this function uses it and expands it if necessary.
@@ -795,11 +794,11 @@ func writeRecord(w io.Writer, buf []byte, recType recordType, rec record, recSiz
 }
 
 // readRecord reads a record from `r`, possibly checking the CRC-32 checksum.
-// When `buf“ is not nil, this function ensures the buffer is big enough to
+// When `buf` is not nil, this function ensures the buffer is big enough to
 // hold the payload (expanding if necessary). Therefore, this call always
 // return `buf`, regardless if there is an error or not.
 // The caller is indicating if the record is supposed to be typed or not.
-func readRecord(r io.Reader, buf []byte, recTyped bool, crcTable *crc32.Table, checkCRC bool) ([]byte, int, recordType, error) {
+func readRecord(r io.Reader, buf []byte, recTyped bool, crcTable *crc32.Table, checkCRC bool, expectedSize int) ([]byte, int, recordType, error) {
 	_header := [recordHeaderSize]byte{}
 	header := _header[:]
 	if _, err := io.ReadFull(r, header); err != nil {
@@ -819,6 +818,9 @@ func readRecord(r io.Reader, buf []byte, recTyped bool, crcTable *crc32.Table, c
 		if crc == 0 {
 			return buf, 0, 0, errNeedRewind
 		}
+	}
+	if expectedSize > 0 && recSize != expectedSize {
+		return buf, 0, 0, fmt.Errorf("expected record size to be %v bytes, got %v bytes", expectedSize, recSize)
 	}
 	// Now we are going to read the payload
 	buf = util.EnsureBufBigEnough(buf, recSize)
@@ -1360,8 +1362,22 @@ func (fs *FileStore) Recover() (*RecoveredState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to recover server file %q: %v", fs.serverFile.name, err)
 	}
+
+	// Get the channels (they are subdirectories of rootDir).
+	// We used to do that after checking for serverInfo and recovering clients.
+	// However, we want to know if there are channles in case serverInfo is nil,
+	// but to maintain behavior on when errors were returned, capture possible
+	// error under a different error variable and return that error (if any)
+	// at the location where we used to.
+	channels, cerr := fs.getChannelsDir()
+
 	// If the server file is empty, then we are done
 	if serverInfo == nil {
+		// If there is no server info stored, we expect no state to be stored,
+		// so if there are possible channles, return an error.
+		if len(channels) > 0 {
+			return nil, ErrNoSrvButChannels
+		}
 		// We return the file store instance, but no recovered state.
 		return nil, nil
 	}
@@ -1372,19 +1388,15 @@ func (fs *FileStore) Recover() (*RecoveredState, error) {
 		return nil, fmt.Errorf("unable to recover client file %q: %v", fs.clientsFile.name, err)
 	}
 
-	// Get the channels (there are subdirectories of rootDir)
-	channels, err = ioutil.ReadDir(fs.fm.rootDir)
-	if err != nil {
+	// If there was an error reading the channels, return the error now.
+	if cerr != nil {
 		return nil, err
 	}
 	if len(channels) > 0 {
 		wg, poolCh, errCh, recoverCh := initParalleRecovery(fs.opts.ParallelRecovery, len(channels))
 		ctx := &channelRecoveryCtx{wg: wg, poolCh: poolCh, errCh: errCh, recoverCh: recoverCh}
 		for _, c := range channels {
-			// Channels are directories. Ignore simple files
-			if !c.IsDir() {
-				continue
-			}
+			// We know that c is a directory (see getChannelsDir())
 			channel := c.Name()
 			channelDirName := filepath.Join(fs.fm.rootDir, channel)
 			limits := fs.genericStore.getChannelLimits(channel)
@@ -1429,6 +1441,25 @@ func (fs *FileStore) Recover() (*RecoveredState, error) {
 		Channels: recoveredChannels,
 	}
 	return recoveredState, nil
+}
+
+func (fs *FileStore) getChannelsDir() ([]os.FileInfo, error) {
+	files, err := os.ReadDir(fs.fm.rootDir)
+	if err != nil {
+		return nil, err
+	}
+	channels := make([]os.FileInfo, 0, len(files))
+	for _, f := range files {
+		if !f.IsDir() {
+			continue
+		}
+		finfo, err := f.Info()
+		if err != nil {
+			return nil, err
+		}
+		channels = append(channels, finfo)
+	}
+	return channels, nil
 }
 
 func initParalleRecovery(maxGoRoutines, foundChannels int) (*sync.WaitGroup, chan struct{}, chan error, chan *recoveredChannel) {
@@ -1580,7 +1611,7 @@ func (fs *FileStore) recoverClients() ([]*Client, error) {
 	br := bufio.NewReaderSize(fs.clientsFile.handle, defaultBufSize)
 
 	for {
-		buf, recSize, recType, err = readRecord(br, buf, true, fs.crcTable, fs.opts.DoCRC)
+		buf, recSize, recType, err = readRecord(br, buf, true, fs.crcTable, fs.opts.DoCRC, 0)
 		if err != nil {
 			switch err {
 			case io.EOF:
@@ -1631,7 +1662,7 @@ func (fs *FileStore) recoverClients() ([]*Client, error) {
 // recoverServerInfo reads the server file and returns a ServerInfo structure
 func (fs *FileStore) recoverServerInfo() (*spb.ServerInfo, error) {
 	info := &spb.ServerInfo{}
-	buf, size, _, err := readRecord(fs.serverFile.handle, nil, false, fs.crcTable, fs.opts.DoCRC)
+	buf, size, _, err := readRecord(fs.serverFile.handle, nil, false, fs.crcTable, fs.opts.DoCRC, 0)
 	if err != nil {
 		if err == io.EOF {
 			// We are done, no state recovered
@@ -1846,7 +1877,7 @@ func (fs *FileStore) compactClientFile(orgFileName string) error {
 
 // Return a temporary file (including file version)
 func getTempFile(rootDir, prefix string) (*os.File, error) {
-	tmpFile, err := ioutil.TempFile(rootDir, prefix)
+	tmpFile, err := os.CreateTemp(rootDir, prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -2022,15 +2053,20 @@ func (fs *FileStore) newFileMsgStore(channelDirName, channel string, limits *Msg
 
 	// Recovery case
 	if doRecover {
-		var dirFiles []os.FileInfo
+		var dirEntries []os.DirEntry
 		var fseq int64
 		var datFile, idxFile *file
 		var useIdxFile bool
 
-		dirFiles, err = ioutil.ReadDir(channelDirName)
-		for _, file := range dirFiles {
-			if file.IsDir() {
+		dirEntries, err = os.ReadDir(channelDirName)
+		for _, entry := range dirEntries {
+			if entry.IsDir() {
 				continue
+			}
+			file, ierr := entry.Info()
+			if ierr != nil {
+				err = ierr
+				break
 			}
 			fileName := file.Name()
 			if !strings.HasPrefix(fileName, msgFilesPrefix) || !strings.HasSuffix(fileName, datSuffix) {
@@ -2388,7 +2424,7 @@ func (ms *FileMsgStore) recoverOneMsgFile(fslice *fileSlice, fseq int, useIdxFil
 		offset = int64(4)
 
 		for {
-			ms.tmpMsgBuf, msgSize, _, err = readRecord(br, ms.tmpMsgBuf, false, crcTable, doCRC)
+			ms.tmpMsgBuf, msgSize, _, err = readRecord(br, ms.tmpMsgBuf, false, crcTable, doCRC, 0)
 			if err != nil {
 				switch err {
 				case io.EOF:
@@ -2497,13 +2533,9 @@ func (ms *FileMsgStore) ensureLastMsgAndIndexMatch(fslice *fileSlice, seq uint64
 	if _, err := fd.Seek(index.offset, io.SeekStart); err != nil {
 		return fmt.Errorf("%s: unable to set position to %v", startErr, index.offset)
 	}
-	ms.tmpMsgBuf, msgSize, _, err = readRecord(fd, ms.tmpMsgBuf, false, ms.fstore.crcTable, true)
+	ms.tmpMsgBuf, msgSize, _, err = readRecord(fd, ms.tmpMsgBuf, false, ms.fstore.crcTable, true, int(index.msgSize))
 	if err != nil {
 		return fmt.Errorf("%s: unable to read last record: %v", startErr, err)
-	}
-	if uint32(msgSize) != index.msgSize {
-		return fmt.Errorf("%s: last message size in index is %v, data file is %v",
-			startErr, index.msgSize, msgSize)
 	}
 	// Recover this message
 	msg := &pb.MsgProto{}
@@ -4017,7 +4049,7 @@ func (ss *FileSubStore) recoverSubscriptions() error {
 	br := bufio.NewReaderSize(ss.file.handle, defaultBufSize)
 
 	for {
-		ss.tmpSubBuf, recSize, recType, err = readRecord(br, ss.tmpSubBuf, true, ss.crcTable, ss.opts.DoCRC)
+		ss.tmpSubBuf, recSize, recType, err = readRecord(br, ss.tmpSubBuf, true, ss.crcTable, ss.opts.DoCRC, 0)
 		if err != nil {
 			switch err {
 			case io.EOF:

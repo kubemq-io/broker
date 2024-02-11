@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"path"
@@ -46,7 +45,7 @@ var (
 var testFDsLimit = int64(5)
 
 func init() {
-	tmpDir, err := ioutil.TempDir(".", "data_stores_")
+	tmpDir, err := os.MkdirTemp(".", "data_stores_")
 	if err != nil {
 		panic("Could not create tmp dir")
 	}
@@ -593,7 +592,8 @@ func TestFSOptions(t *testing.T) {
 		FileDescriptorsLimit(20),
 		ParallelRecovery(5),
 		ReadBufferSize(5*1024),
-		AutoSync(2*time.Minute))
+		AutoSync(2*time.Minute),
+	)
 	if err != nil {
 		t.Fatalf("Unexpected error on file store create: %v", err)
 	}
@@ -1397,7 +1397,7 @@ func TestFSReadRecord(t *testing.T) {
 	// Reader returns an error
 	errReturned := fmt.Errorf("Fake error")
 	r.setErrToReturn(errReturned)
-	retBuf, recSize, recType, err = readRecord(r, buf, false, crc32.IEEETable, true)
+	retBuf, recSize, recType, err = readRecord(r, buf, false, crc32.IEEETable, true, 0)
 	if !strings.Contains(err.Error(), errReturned.Error()) {
 		t.Fatalf("Expected error %v, got: %v", errReturned, err)
 	}
@@ -1417,7 +1417,7 @@ func TestFSReadRecord(t *testing.T) {
 	util.ByteOrder.PutUint32(header, 0)
 	r.setErrToReturn(nil)
 	r.setContent(header)
-	retBuf, recSize, recType, err = readRecord(r, buf, false, crc32.IEEETable, true)
+	retBuf, recSize, recType, err = readRecord(r, buf, false, crc32.IEEETable, true, 0)
 	if err == nil {
 		t.Fatal("Expected error got none")
 	}
@@ -1437,7 +1437,7 @@ func TestFSReadRecord(t *testing.T) {
 	copy(b[recordHeaderSize:], []byte("hello"))
 	r.setErrToReturn(nil)
 	r.setContent(b)
-	retBuf, recSize, recType, err = readRecord(r, buf, false, crc32.IEEETable, true)
+	retBuf, recSize, recType, err = readRecord(r, buf, false, crc32.IEEETable, true, 0)
 	if err == nil {
 		t.Fatal("Expected error got none")
 	}
@@ -1452,7 +1452,7 @@ func TestFSReadRecord(t *testing.T) {
 	}
 	// Not asking for CRC should return ok
 	r.setContent(b)
-	retBuf, recSize, recType, err = readRecord(r, buf, false, crc32.IEEETable, false)
+	retBuf, recSize, recType, err = readRecord(r, buf, false, crc32.IEEETable, false, 0)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1474,7 +1474,7 @@ func TestFSReadRecord(t *testing.T) {
 	copy(b[recordHeaderSize:], payload)
 	r.setErrToReturn(nil)
 	r.setContent(b)
-	retBuf, recSize, recType, err = readRecord(r, buf, false, crc32.IEEETable, true)
+	retBuf, recSize, recType, err = readRecord(r, buf, false, crc32.IEEETable, true, 0)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1492,7 +1492,7 @@ func TestFSReadRecord(t *testing.T) {
 	util.ByteOrder.PutUint32(b, 1<<24|10) // reuse previous buf
 	r.setErrToReturn(nil)
 	r.setContent(b)
-	retBuf, recSize, recType, err = readRecord(r, buf, true, crc32.IEEETable, true)
+	retBuf, recSize, recType, err = readRecord(r, buf, true, crc32.IEEETable, true, 0)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1512,9 +1512,24 @@ func TestFSReadRecord(t *testing.T) {
 	}
 	// Don't call setContent since this would reset the read position
 	r.content = b
-	_, _, _, err = readRecord(r, buf, true, crc32.IEEETable, true)
+	_, _, _, err = readRecord(r, buf, true, crc32.IEEETable, true, 0)
 	if err != errNeedRewind {
 		t.Fatalf("Expected error %v, got %v", errNeedRewind, err)
+	}
+
+	// Check that record size limit is enforced
+	b = make([]byte, recordHeaderSize+10)
+	util.ByteOrder.PutUint32(b, uint32(len(payload)))
+	util.ByteOrder.PutUint32(b[4:recordHeaderSize], crc32.ChecksumIEEE(payload))
+	copy(b[recordHeaderSize:], payload)
+	r.setErrToReturn(nil)
+	r.setContent(b)
+	_, recSize, _, err = readRecord(r, buf, false, crc32.IEEETable, true, 5)
+	if err == nil || !strings.Contains(err.Error(), "expected record size to be 5 bytes, got 10 bytes") {
+		t.Fatalf("Expected record size of 5 bytes error, got %v", err)
+	}
+	if recSize != 0 {
+		t.Fatalf("Expected recSize to be 0, got %v", recSize)
 	}
 }
 
@@ -1758,8 +1773,8 @@ func TestFSParallelRecovery(t *testing.T) {
 	numRoutines := runtime.NumGoroutine()
 	// Make several channels fail to recover
 	fname := fmt.Sprintf("%s.1.%s", msgFilesPrefix, datSuffix)
-	ioutil.WriteFile(filepath.Join(testFSDefaultDatastore, "foo.50", fname), []byte("dummy"), 0666)
-	ioutil.WriteFile(filepath.Join(testFSDefaultDatastore, "foo.51", fname), []byte("dummy"), 0666)
+	os.WriteFile(filepath.Join(testFSDefaultDatastore, "foo.50", fname), []byte("dummy"), 0666)
+	os.WriteFile(filepath.Join(testFSDefaultDatastore, "foo.51", fname), []byte("dummy"), 0666)
 	s, err := NewFileStore(testLogger, testFSDefaultDatastore, &testDefaultStoreLimits, ParallelRecovery(10))
 	if err == nil {
 		_, err = s.Recover()
@@ -2073,7 +2088,7 @@ func TestFSServerAndClientFilesVersionError(t *testing.T) {
 
 			s.Close()
 			os.Remove(fname)
-			if err := ioutil.WriteFile(fname, []byte(""), 0666); err != nil {
+			if err := os.WriteFile(fname, []byte(""), 0666); err != nil {
 				t.Fatalf("Error creating file: %v", err)
 			}
 

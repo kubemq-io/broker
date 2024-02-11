@@ -1,4 +1,4 @@
-// Copyright 2021-2022 The NATS Authors
+// Copyright 2021-2023 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -29,14 +29,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nats-io/nats.go/internal/parser"
 	"github.com/nats-io/nuid"
 )
 
 // ObjectStoreManager creates, loads and deletes Object Stores
-//
-// Notice: Experimental Preview
-//
-// This functionality is EXPERIMENTAL and may be changed in later releases.
 type ObjectStoreManager interface {
 	// ObjectStore will look up and bind to an existing object store instance.
 	ObjectStore(bucket string) (ObjectStore, error)
@@ -46,39 +43,35 @@ type ObjectStoreManager interface {
 	DeleteObjectStore(bucket string) error
 	// ObjectStoreNames is used to retrieve a list of bucket names
 	ObjectStoreNames(opts ...ObjectOpt) <-chan string
-	// ObjectStores is used to retrieve a list of buckets
-	ObjectStores(opts ...ObjectOpt) <-chan ObjectStore
+	// ObjectStores is used to retrieve a list of bucket statuses
+	ObjectStores(opts ...ObjectOpt) <-chan ObjectStoreStatus
 }
 
 // ObjectStore is a blob store capable of storing large objects efficiently in
 // JetStream streams
-//
-// Notice: Experimental Preview
-//
-// This functionality is EXPERIMENTAL and may be changed in later releases.
 type ObjectStore interface {
 	// Put will place the contents from the reader into a new object.
 	Put(obj *ObjectMeta, reader io.Reader, opts ...ObjectOpt) (*ObjectInfo, error)
 	// Get will pull the named object from the object store.
-	Get(name string, opts ...ObjectOpt) (ObjectResult, error)
+	Get(name string, opts ...GetObjectOpt) (ObjectResult, error)
 
 	// PutBytes is convenience function to put a byte slice into this object store.
 	PutBytes(name string, data []byte, opts ...ObjectOpt) (*ObjectInfo, error)
 	// GetBytes is a convenience function to pull an object from this object store and return it as a byte slice.
-	GetBytes(name string, opts ...ObjectOpt) ([]byte, error)
+	GetBytes(name string, opts ...GetObjectOpt) ([]byte, error)
 
 	// PutString is convenience function to put a string into this object store.
 	PutString(name string, data string, opts ...ObjectOpt) (*ObjectInfo, error)
 	// GetString is a convenience function to pull an object from this object store and return it as a string.
-	GetString(name string, opts ...ObjectOpt) (string, error)
+	GetString(name string, opts ...GetObjectOpt) (string, error)
 
 	// PutFile is convenience function to put a file into this object store.
 	PutFile(file string, opts ...ObjectOpt) (*ObjectInfo, error)
 	// GetFile is a convenience function to pull an object from this object store and place it in a file.
-	GetFile(name, file string, opts ...ObjectOpt) error
+	GetFile(name, file string, opts ...GetObjectOpt) error
 
 	// GetInfo will retrieve the current information for the object.
-	GetInfo(name string) (*ObjectInfo, error)
+	GetInfo(name string, opts ...GetObjectInfoOpt) (*ObjectInfo, error)
 	// UpdateMeta will update the metadata for the object.
 	UpdateMeta(name string, meta *ObjectMeta) error
 
@@ -98,7 +91,7 @@ type ObjectStore interface {
 	Watch(opts ...WatchOpt) (ObjectWatcher, error)
 
 	// List will list all the objects in this store.
-	List(opts ...WatchOpt) ([]*ObjectInfo, error)
+	List(opts ...ListObjectsOpt) ([]*ObjectInfo, error)
 
 	// Status retrieves run-time status about the backing store of the bucket.
 	Status() (ObjectStoreStatus, error)
@@ -149,13 +142,17 @@ var (
 
 // ObjectStoreConfig is the config for the object store.
 type ObjectStoreConfig struct {
-	Bucket      string
-	Description string
-	TTL         time.Duration
-	MaxBytes    int64
-	Storage     StorageType
-	Replicas    int
-	Placement   *Placement
+	Bucket      string        `json:"bucket"`
+	Description string        `json:"description,omitempty"`
+	TTL         time.Duration `json:"max_age,omitempty"`
+	MaxBytes    int64         `json:"max_bytes,omitempty"`
+	Storage     StorageType   `json:"storage,omitempty"`
+	Replicas    int           `json:"num_replicas,omitempty"`
+	Placement   *Placement    `json:"placement,omitempty"`
+
+	// Bucket-specific metadata
+	// NOTE: Metadata requires nats-server v2.10.0+
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 type ObjectStoreStatus interface {
@@ -175,6 +172,8 @@ type ObjectStoreStatus interface {
 	Size() uint64
 	// BackingStore provides details about the underlying storage
 	BackingStore() string
+	// Metadata is the user supplied metadata for the bucket
+	Metadata() map[string]string
 }
 
 // ObjectMetaOptions
@@ -185,9 +184,10 @@ type ObjectMetaOptions struct {
 
 // ObjectMeta is high level information about an object.
 type ObjectMeta struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	Headers     Header `json:"headers,omitempty"`
+	Name        string            `json:"name"`
+	Description string            `json:"description,omitempty"`
+	Headers     Header            `json:"headers,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
 
 	// Optional options.
 	Opts *ObjectMetaOptions `json:"options,omitempty"`
@@ -279,6 +279,7 @@ func (js *js) CreateObjectStore(cfg *ObjectStoreConfig) (ObjectStore, error) {
 		Discard:     DiscardNew,
 		AllowRollup: true,
 		AllowDirect: true,
+		Metadata:    cfg.Metadata,
 	}
 
 	// Create our stream.
@@ -349,7 +350,7 @@ func (obs *obs) Put(meta *ObjectMeta, r io.Reader, opts ...ObjectOpt) (*ObjectIn
 
 	// Grab existing meta info (einfo). Ok to be found or not found, any other error is a problem
 	// Chunks on the old nuid can be cleaned up at the end
-	einfo, err := obs.GetInfo(meta.Name) // GetInfo will encode the name
+	einfo, err := obs.GetInfo(meta.Name, GetObjectInfoShowDeleted()) // GetInfo will encode the name
 	if err != nil && err != ErrObjectNotFound {
 		return nil, err
 	}
@@ -368,12 +369,24 @@ func (obs *obs) Put(meta *ObjectMeta, r io.Reader, opts ...ObjectOpt) (*ObjectIn
 		return perr
 	}
 
-	purgePartial := func() { obs.js.purgeStream(obs.stream, &StreamPurgeRequest{Subject: chunkSubj}) }
-
 	// Create our own JS context to handle errors etc.
-	js, err := obs.js.nc.JetStream(PublishAsyncErrHandler(func(js JetStream, _ *Msg, err error) { setErr(err) }))
+	jetStream, err := obs.js.nc.JetStream(PublishAsyncErrHandler(func(js JetStream, _ *Msg, err error) { setErr(err) }))
 	if err != nil {
 		return nil, err
+	}
+
+	defer jetStream.(*js).cleanupReplySub()
+
+	purgePartial := func() error {
+		// wait until all pubs are complete or up to default timeout before attempting purge
+		select {
+		case <-jetStream.PublishAsyncComplete():
+		case <-time.After(obs.js.opts.wait):
+		}
+		if err := obs.js.purgeStream(obs.stream, &StreamPurgeRequest{Subject: chunkSubj}); err != nil {
+			return fmt.Errorf("could not cleanup bucket after erronous put operation: %w", err)
+		}
+		return nil
 	}
 
 	m, h := NewMsg(chunkSubj), sha256.New()
@@ -394,7 +407,9 @@ func (obs *obs) Put(meta *ObjectMeta, r io.Reader, opts ...ObjectOpt) (*ObjectIn
 			default:
 			}
 			if err != nil {
-				purgePartial()
+				if purgeErr := purgePartial(); purgeErr != nil {
+					return nil, errors.Join(err, purgeErr)
+				}
 				return nil, err
 			}
 		}
@@ -405,7 +420,9 @@ func (obs *obs) Put(meta *ObjectMeta, r io.Reader, opts ...ObjectOpt) (*ObjectIn
 
 		// Handle all non EOF errors
 		if readErr != nil && readErr != io.EOF {
-			purgePartial()
+			if purgeErr := purgePartial(); purgeErr != nil {
+				return nil, errors.Join(readErr, purgeErr)
+			}
 			return nil, readErr
 		}
 
@@ -416,12 +433,16 @@ func (obs *obs) Put(meta *ObjectMeta, r io.Reader, opts ...ObjectOpt) (*ObjectIn
 			h.Write(m.Data)
 
 			// Send msg itself.
-			if _, err := js.PublishMsgAsync(m); err != nil {
-				purgePartial()
+			if _, err := jetStream.PublishMsgAsync(m); err != nil {
+				if purgeErr := purgePartial(); purgeErr != nil {
+					return nil, errors.Join(err, purgeErr)
+				}
 				return nil, err
 			}
 			if err := getErr(); err != nil {
-				purgePartial()
+				if purgeErr := purgePartial(); purgeErr != nil {
+					return nil, errors.Join(err, purgeErr)
+				}
 				return nil, err
 			}
 			// Update totals.
@@ -445,26 +466,32 @@ func (obs *obs) Put(meta *ObjectMeta, r io.Reader, opts ...ObjectOpt) (*ObjectIn
 	mm.Data, err = json.Marshal(info)
 	if err != nil {
 		if r != nil {
-			purgePartial()
+			if purgeErr := purgePartial(); purgeErr != nil {
+				return nil, errors.Join(err, purgeErr)
+			}
 		}
 		return nil, err
 	}
 
 	// Publish the meta message.
-	_, err = js.PublishMsgAsync(mm)
+	_, err = jetStream.PublishMsgAsync(mm)
 	if err != nil {
 		if r != nil {
-			purgePartial()
+			if purgeErr := purgePartial(); purgeErr != nil {
+				return nil, errors.Join(err, purgeErr)
+			}
 		}
 		return nil, err
 	}
 
 	// Wait for all to be processed.
 	select {
-	case <-js.PublishAsyncComplete():
+	case <-jetStream.PublishAsyncComplete():
 		if err := getErr(); err != nil {
 			if r != nil {
-				purgePartial()
+				if purgeErr := purgePartial(); purgeErr != nil {
+					return nil, errors.Join(err, purgeErr)
+				}
 			}
 			return nil, err
 		}
@@ -477,7 +504,9 @@ func (obs *obs) Put(meta *ObjectMeta, r io.Reader, opts ...ObjectOpt) (*ObjectIn
 	// Delete any original chunks.
 	if einfo != nil && !einfo.Deleted {
 		echunkSubj := fmt.Sprintf(objChunksPreTmpl, obs.name, einfo.NUID)
-		obs.js.purgeStream(obs.stream, &StreamPurgeRequest{Subject: echunkSubj})
+		if err := obs.js.purgeStream(obs.stream, &StreamPurgeRequest{Subject: echunkSubj}); err != nil {
+			return info, err
+		}
 	}
 
 	// TODO would it be okay to do this to return the info with the correct time?
@@ -517,10 +546,56 @@ func (info *ObjectInfo) isLink() bool {
 	return info.ObjectMeta.Opts != nil && info.ObjectMeta.Opts.Link != nil
 }
 
+type GetObjectOpt interface {
+	configureGetObject(opts *getObjectOpts) error
+}
+type getObjectOpts struct {
+	ctx context.Context
+	// Include deleted object in the result.
+	showDeleted bool
+}
+
+type getObjectFn func(opts *getObjectOpts) error
+
+func (opt getObjectFn) configureGetObject(opts *getObjectOpts) error {
+	return opt(opts)
+}
+
+// GetObjectShowDeleted makes Get() return object if it was marked as deleted.
+func GetObjectShowDeleted() GetObjectOpt {
+	return getObjectFn(func(opts *getObjectOpts) error {
+		opts.showDeleted = true
+		return nil
+	})
+}
+
+// For nats.Context() support.
+func (ctx ContextOpt) configureGetObject(opts *getObjectOpts) error {
+	opts.ctx = ctx
+	return nil
+}
+
 // Get will pull the object from the underlying stream.
-func (obs *obs) Get(name string, opts ...ObjectOpt) (ObjectResult, error) {
+func (obs *obs) Get(name string, opts ...GetObjectOpt) (ObjectResult, error) {
+	var o getObjectOpts
+	for _, opt := range opts {
+		if opt != nil {
+			if err := opt.configureGetObject(&o); err != nil {
+				return nil, err
+			}
+		}
+	}
+	ctx := o.ctx
+	infoOpts := make([]GetObjectInfoOpt, 0)
+	if ctx != nil {
+		infoOpts = append(infoOpts, Context(ctx))
+	}
+	if o.showDeleted {
+		infoOpts = append(infoOpts, GetObjectInfoShowDeleted())
+	}
+
 	// Grab meta info.
-	info, err := obs.GetInfo(name)
+	info, err := obs.GetInfo(name, infoOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -548,16 +623,6 @@ func (obs *obs) Get(name string, opts ...ObjectOpt) (ObjectResult, error) {
 		return lobs.Get(info.ObjectMeta.Opts.Link.Name)
 	}
 
-	var o objOpts
-	for _, opt := range opts {
-		if opt != nil {
-			if err := opt.configureObject(&o); err != nil {
-				return nil, err
-			}
-		}
-	}
-	ctx := o.ctx
-
 	result := &objResult{info: info, ctx: ctx}
 	if info.Size == 0 {
 		return result, nil
@@ -576,10 +641,11 @@ func (obs *obs) Get(name string, opts ...ObjectOpt) (ObjectResult, error) {
 	result.digest = sha256.New()
 
 	processChunk := func(m *Msg) {
+		var err error
 		if ctx != nil {
 			select {
 			case <-ctx.Done():
-				if ctx.Err() == context.Canceled {
+				if errors.Is(ctx.Err(), context.Canceled) {
 					err = ctx.Err()
 				} else {
 					err = ErrTimeout
@@ -592,7 +658,7 @@ func (obs *obs) Get(name string, opts ...ObjectOpt) (ObjectResult, error) {
 			}
 		}
 
-		tokens, err := getMetadataFields(m.Reply)
+		tokens, err := parser.GetMetadataFields(m.Reply)
 		if err != nil {
 			gotErr(m, err)
 			return
@@ -611,7 +677,7 @@ func (obs *obs) Get(name string, opts ...ObjectOpt) (ObjectResult, error) {
 		result.digest.Write(m.Data)
 
 		// Check if we are done.
-		if tokens[ackNumPendingTokenPos] == objNoPending {
+		if tokens[parser.AckNumPendingTokenPos] == objNoPending {
 			pw.Close()
 			m.Sub.Unsubscribe()
 		}
@@ -629,7 +695,7 @@ func (obs *obs) Get(name string, opts ...ObjectOpt) (ObjectResult, error) {
 // Delete will delete the object.
 func (obs *obs) Delete(name string) error {
 	// Grab meta info.
-	info, err := obs.GetInfo(name)
+	info, err := obs.GetInfo(name, GetObjectInfoShowDeleted())
 	if err != nil {
 		return err
 	}
@@ -694,7 +760,7 @@ func (obs *obs) AddLink(name string, obj *ObjectInfo) (*ObjectInfo, error) {
 	// If object with link's name is found, error.
 	// If link with link's name is found, that's okay to overwrite.
 	// If there was an error that was not ErrObjectNotFound, error.
-	einfo, err := obs.GetInfo(name)
+	einfo, err := obs.GetInfo(name, GetObjectInfoShowDeleted())
 	if einfo != nil {
 		if !einfo.isLink() {
 			return nil, ErrObjectAlreadyExists
@@ -734,7 +800,7 @@ func (ob *obs) AddBucketLink(name string, bucket ObjectStore) (*ObjectInfo, erro
 	// If object with link's name is found, error.
 	// If link with link's name is found, that's okay to overwrite.
 	// If there was an error that was not ErrObjectNotFound, error.
-	einfo, err := ob.GetInfo(name)
+	einfo, err := ob.GetInfo(name, GetObjectInfoShowDeleted())
 	if einfo != nil {
 		if !einfo.isLink() {
 			return nil, ErrObjectAlreadyExists
@@ -765,7 +831,7 @@ func (obs *obs) PutBytes(name string, data []byte, opts ...ObjectOpt) (*ObjectIn
 }
 
 // GetBytes is a convenience function to pull an object from this object store and return it as a byte slice.
-func (obs *obs) GetBytes(name string, opts ...ObjectOpt) ([]byte, error) {
+func (obs *obs) GetBytes(name string, opts ...GetObjectOpt) ([]byte, error) {
 	result, err := obs.Get(name, opts...)
 	if err != nil {
 		return nil, err
@@ -785,7 +851,7 @@ func (obs *obs) PutString(name string, data string, opts ...ObjectOpt) (*ObjectI
 }
 
 // GetString is a convenience function to pull an object from this object store and return it as a string.
-func (obs *obs) GetString(name string, opts ...ObjectOpt) (string, error) {
+func (obs *obs) GetString(name string, opts ...GetObjectOpt) (string, error) {
 	result, err := obs.Get(name, opts...)
 	if err != nil {
 		return _EMPTY_, err
@@ -810,7 +876,7 @@ func (obs *obs) PutFile(file string, opts ...ObjectOpt) (*ObjectInfo, error) {
 }
 
 // GetFile is a convenience function to pull and object and place in a file.
-func (obs *obs) GetFile(name, file string, opts ...ObjectOpt) error {
+func (obs *obs) GetFile(name, file string, opts ...GetObjectOpt) error {
 	// Expect file to be new.
 	f, err := os.OpenFile(file, os.O_WRONLY|os.O_CREATE, 0600)
 	if err != nil {
@@ -830,11 +896,48 @@ func (obs *obs) GetFile(name, file string, opts ...ObjectOpt) error {
 	return err
 }
 
+type GetObjectInfoOpt interface {
+	configureGetInfo(opts *getObjectInfoOpts) error
+}
+type getObjectInfoOpts struct {
+	ctx context.Context
+	// Include deleted object in the result.
+	showDeleted bool
+}
+
+type getObjectInfoFn func(opts *getObjectInfoOpts) error
+
+func (opt getObjectInfoFn) configureGetInfo(opts *getObjectInfoOpts) error {
+	return opt(opts)
+}
+
+// GetObjectInfoShowDeleted makes GetInfo() return object if it was marked as deleted.
+func GetObjectInfoShowDeleted() GetObjectInfoOpt {
+	return getObjectInfoFn(func(opts *getObjectInfoOpts) error {
+		opts.showDeleted = true
+		return nil
+	})
+}
+
+// For nats.Context() support.
+func (ctx ContextOpt) configureGetInfo(opts *getObjectInfoOpts) error {
+	opts.ctx = ctx
+	return nil
+}
+
 // GetInfo will retrieve the current information for the object.
-func (obs *obs) GetInfo(name string) (*ObjectInfo, error) {
+func (obs *obs) GetInfo(name string, opts ...GetObjectInfoOpt) (*ObjectInfo, error) {
 	// Grab last meta value we have.
 	if name == "" {
 		return nil, ErrNameRequired
+	}
+	var o getObjectInfoOpts
+	for _, opt := range opts {
+		if opt != nil {
+			if err := opt.configureGetInfo(&o); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	metaSubj := fmt.Sprintf(objMetaPreTmpl, obs.name, encodeName(name)) // used as data in a JS API call
@@ -842,7 +945,7 @@ func (obs *obs) GetInfo(name string) (*ObjectInfo, error) {
 
 	m, err := obs.js.GetLastMsg(stream, metaSubj)
 	if err != nil {
-		if err == ErrMsgNotFound {
+		if errors.Is(err, ErrMsgNotFound) {
 			err = ErrObjectNotFound
 		}
 		return nil, err
@@ -850,6 +953,9 @@ func (obs *obs) GetInfo(name string) (*ObjectInfo, error) {
 	var info ObjectInfo
 	if err := json.Unmarshal(m.Data, &info); err != nil {
 		return nil, ErrBadObjectMeta
+	}
+	if !o.showDeleted && info.Deleted {
+		return nil, ErrObjectNotFound
 	}
 	info.ModTime = m.Time
 	return &info, nil
@@ -864,17 +970,16 @@ func (obs *obs) UpdateMeta(name string, meta *ObjectMeta) error {
 	// Grab the current meta.
 	info, err := obs.GetInfo(name)
 	if err != nil {
+		if errors.Is(err, ErrObjectNotFound) {
+			return ErrUpdateMetaDeleted
+		}
 		return err
-	}
-
-	if info.Deleted {
-		return ErrUpdateMetaDeleted
 	}
 
 	// If the new name is different from the old, and it exists, error
 	// If there was an error that was not ErrObjectNotFound, error.
 	if name != meta.Name {
-		existingInfo, err := obs.GetInfo(meta.Name)
+		existingInfo, err := obs.GetInfo(meta.Name, GetObjectInfoShowDeleted())
 		if err != nil && !errors.Is(err, ErrObjectNotFound) {
 			return err
 		}
@@ -888,6 +993,7 @@ func (obs *obs) UpdateMeta(name string, meta *ObjectMeta) error {
 	info.Name = meta.Name
 	info.Description = meta.Description
 	info.Headers = meta.Headers
+	info.Metadata = meta.Metadata
 
 	// Prepare the meta message
 	if err = publishMeta(info, obs.js); err != nil {
@@ -970,6 +1076,8 @@ func (obs *obs) Watch(opts ...WatchOpt) (ObjectWatcher, error) {
 			w.updates <- &info
 		}
 
+		// if UpdatesOnly is set, no not send nil to the channel
+		// as it would always be triggered after initializing the watcher
 		if !initDoneMarker && meta.NumPending == 0 {
 			initDoneMarker = true
 			w.updates <- nil
@@ -978,15 +1086,26 @@ func (obs *obs) Watch(opts ...WatchOpt) (ObjectWatcher, error) {
 
 	allMeta := fmt.Sprintf(objAllMetaPreTmpl, obs.name)
 	_, err := obs.js.GetLastMsg(obs.stream, allMeta)
-	if err == ErrMsgNotFound {
+	// if there are no messages on the stream and we are not watching
+	// updates only, send nil to the channel to indicate that the initial
+	// watch is done
+	if !o.updatesOnly {
+		if errors.Is(err, ErrMsgNotFound) {
+			initDoneMarker = true
+			w.updates <- nil
+		}
+	} else {
+		// if UpdatesOnly was used, mark initialization as complete
 		initDoneMarker = true
-		w.updates <- nil
 	}
 
 	// Used ordered consumer to deliver results.
 	subOpts := []SubOpt{OrderedConsumer()}
 	if !o.includeHistory {
 		subOpts = append(subOpts, DeliverLastPerSubject())
+	}
+	if o.updatesOnly {
+		subOpts = append(subOpts, DeliverNew())
 	}
 	sub, err := obs.js.Subscribe(allMeta, update, subOpts...)
 	if err != nil {
@@ -996,21 +1115,71 @@ func (obs *obs) Watch(opts ...WatchOpt) (ObjectWatcher, error) {
 	return w, nil
 }
 
+type ListObjectsOpt interface {
+	configureListObjects(opts *listObjectOpts) error
+}
+type listObjectOpts struct {
+	ctx context.Context
+	// Include deleted objects in the result channel.
+	showDeleted bool
+}
+
+type listObjectsFn func(opts *listObjectOpts) error
+
+func (opt listObjectsFn) configureListObjects(opts *listObjectOpts) error {
+	return opt(opts)
+}
+
+// ListObjectsShowDeleted makes ListObjects() return deleted objects.
+func ListObjectsShowDeleted() ListObjectsOpt {
+	return listObjectsFn(func(opts *listObjectOpts) error {
+		opts.showDeleted = true
+		return nil
+	})
+}
+
+// For nats.Context() support.
+func (ctx ContextOpt) configureListObjects(opts *listObjectOpts) error {
+	opts.ctx = ctx
+	return nil
+}
+
 // List will list all the objects in this store.
-func (obs *obs) List(opts ...WatchOpt) ([]*ObjectInfo, error) {
-	opts = append(opts, IgnoreDeletes())
-	watcher, err := obs.Watch(opts...)
+func (obs *obs) List(opts ...ListObjectsOpt) ([]*ObjectInfo, error) {
+	var o listObjectOpts
+	for _, opt := range opts {
+		if opt != nil {
+			if err := opt.configureListObjects(&o); err != nil {
+				return nil, err
+			}
+		}
+	}
+	watchOpts := make([]WatchOpt, 0)
+	if !o.showDeleted {
+		watchOpts = append(watchOpts, IgnoreDeletes())
+	}
+	watcher, err := obs.Watch(watchOpts...)
 	if err != nil {
 		return nil, err
 	}
 	defer watcher.Stop()
+	if o.ctx == nil {
+		o.ctx = context.Background()
+	}
 
 	var objs []*ObjectInfo
-	for entry := range watcher.Updates() {
-		if entry == nil {
-			break
+	updates := watcher.Updates()
+Updates:
+	for {
+		select {
+		case entry := <-updates:
+			if entry == nil {
+				break Updates
+			}
+			objs = append(objs, entry)
+		case <-o.ctx.Done():
+			return nil, o.ctx.Err()
 		}
-		objs = append(objs, entry)
 	}
 	if len(objs) == 0 {
 		return nil, ErrNoObjectsFound
@@ -1048,6 +1217,9 @@ func (s *ObjectBucketStatus) Size() uint64 { return s.nfo.State.Bytes }
 // BackingStore indicates what technology is used for storage of the bucket
 func (s *ObjectBucketStatus) BackingStore() string { return "JetStream" }
 
+// Metadata is the metadata supplied when creating the bucket
+func (s *ObjectBucketStatus) Metadata() map[string]string { return s.nfo.Config.Metadata }
+
 // StreamInfo is the stream info retrieved to create the status
 func (s *ObjectBucketStatus) StreamInfo() *StreamInfo { return s.nfo }
 
@@ -1082,7 +1254,7 @@ func (o *objResult) Read(p []byte) (n int, err error) {
 		}
 	}
 	if o.err != nil {
-		return 0, err
+		return 0, o.err
 	}
 	if o.r == nil {
 		return 0, io.EOF
@@ -1189,8 +1361,8 @@ func (js *js) ObjectStoreNames(opts ...ObjectOpt) <-chan string {
 	return ch
 }
 
-// ObjectStores is used to retrieve a list of buckets
-func (js *js) ObjectStores(opts ...ObjectOpt) <-chan ObjectStore {
+// ObjectStores is used to retrieve a list of bucket statuses
+func (js *js) ObjectStores(opts ...ObjectOpt) <-chan ObjectStoreStatus {
 	var o objOpts
 	for _, opt := range opts {
 		if opt != nil {
@@ -1199,7 +1371,7 @@ func (js *js) ObjectStores(opts ...ObjectOpt) <-chan ObjectStore {
 			}
 		}
 	}
-	ch := make(chan ObjectStore)
+	ch := make(chan ObjectStoreStatus)
 	var cancel context.CancelFunc
 	if o.ctx == nil {
 		o.ctx, cancel = context.WithTimeout(context.Background(), defaultRequestWait)
@@ -1218,7 +1390,10 @@ func (js *js) ObjectStores(opts ...ObjectOpt) <-chan ObjectStore {
 					continue
 				}
 				select {
-				case ch <- &obs{name: strings.TrimPrefix(info.Config.Name, "OBJ_"), stream: info.Config.Name, js: js}:
+				case ch <- &ObjectBucketStatus{
+					nfo:    info,
+					bucket: strings.TrimPrefix(info.Config.Name, "OBJ_"),
+				}:
 				case <-o.ctx.Done():
 					return
 				}

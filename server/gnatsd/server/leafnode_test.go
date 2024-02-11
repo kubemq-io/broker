@@ -26,7 +26,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
+	"github.com/kubemq-io/broker/client/nats"
 )
 
 type captureLeafNodeRandomIPLogger struct {

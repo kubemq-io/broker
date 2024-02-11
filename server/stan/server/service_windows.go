@@ -106,11 +106,11 @@ loop:
 			break loop
 		case reopenLogCmd:
 			// File log re-open for rotating file logs.
-			server.log.ReopenLogFile()
+			//server.log.ReopenLogFile()
 		case svc.ParamChange:
 		// Ignore for now
 		default:
-			server.log.Debugf("Unexpected control request: %v", change.Cmd)
+			//server.log.Debugf("Unexpected control request: %v", change.Cmd)
 		}
 	}
 

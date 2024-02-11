@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
+	"github.com/kubemq-io/broker/client/nats"
 )
 
 const PING_CLIENT_PORT = 11228

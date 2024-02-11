@@ -1,4 +1,4 @@
-// Copyright 2016-2019 The NATS Authors
+// Copyright 2016-2021 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -199,6 +199,11 @@ func ProcessConfigFile(configFile string, opts *Options) error {
 				return err
 			}
 			opts.NKeySeedFile = v.(string)
+		case "replace_durable", "replace_durables", "replace_duplicate_durable", "replace_duplicate_durables":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.ReplaceDurable = v.(bool)
 		}
 	}
 	return nil
@@ -346,6 +351,21 @@ func parseCluster(itf interface{}, opts *Options) error {
 			case "raft_commit_timeout":
 				opts.Clustering.RaftCommitTimeout = dur
 			}
+		case "bolt_free_list_sync":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.Clustering.BoltFreeListSync = v.(bool)
+		case "bolt_free_list_map":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.Clustering.BoltFreeListMap = v.(bool)
+		case "nodes_connections":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.Clustering.NodesConnections = v.(bool)
 		}
 	}
 	return nil
@@ -590,6 +610,11 @@ func parseSQLOptions(itf interface{}, opts *Options) error {
 				return err
 			}
 			opts.SQLStoreOpts.MaxOpenConns = int(v.(int64))
+		case "bulk_insert_limit":
+			if err := checkType(name, reflect.Int64, v); err != nil {
+				return err
+			}
+			opts.SQLStoreOpts.BulkInsertLimit = int(v.(int64))
 		}
 	}
 	return nil
@@ -683,10 +708,12 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	defSQLOpts := stores.DefaultSQLStoreOptions()
 	fs.BoolVar(&sopts.SQLStoreOpts.NoCaching, "sql_no_caching", defSQLOpts.NoCaching, "Enable/Disable caching")
 	fs.IntVar(&sopts.SQLStoreOpts.MaxOpenConns, "sql_max_open_conns", defSQLOpts.MaxOpenConns, "Max opened connections to the database")
+	fs.IntVar(&sopts.SQLStoreOpts.BulkInsertLimit, "sql_bulk_insert_limit", 0, "Limit the number of messages inserted in one SQL query")
 	fs.StringVar(&sopts.SyslogName, "syslog_name", "", "Syslog Name")
 	fs.BoolVar(&sopts.Encrypt, "encrypt", false, "Specify if server should use encryption at rest")
 	fs.StringVar(&sopts.EncryptionCipher, "encryption_cipher", stores.CryptoCipherAutoSelect, "Encryption cipher. Supported are AES and CHACHA (default is AES)")
 	fs.StringVar(&encryptionKey, "encryption_key", "", "Encryption Key. It is recommended to specify it through the NATS_STREAMING_ENCRYPTION_KEY environment variable instead")
+	fs.BoolVar(&sopts.ReplaceDurable, "replace_durable", false, "Replace the existing durable subscription instead of reporting a duplicate durable error")
 
 	// First, we need to call NATS's ConfigureOptions() with above flag set.
 	// It will be augmented with NATS specific flags and call fs.Parse(args) for us.

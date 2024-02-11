@@ -1,4 +1,4 @@
-// Copyright 2012-2018 The NATS Authors
+// Copyright 2012-2023 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -35,7 +35,7 @@ var falseB = []byte("false")
 var nilB = []byte("")
 
 // Encode
-func (je *DefaultEncoder) Encode(subject string, v interface{}) ([]byte, error) {
+func (je *DefaultEncoder) Encode(subject string, v any) ([]byte, error) {
 	switch arg := v.(type) {
 	case string:
 		bytes := *(*[]byte)(unsafe.Pointer(&arg))
@@ -58,7 +58,7 @@ func (je *DefaultEncoder) Encode(subject string, v interface{}) ([]byte, error) 
 }
 
 // Decode
-func (je *DefaultEncoder) Decode(subject string, data []byte, vPtr interface{}) error {
+func (je *DefaultEncoder) Decode(subject string, data []byte, vPtr any) error {
 	// Figure out what it's pointing to...
 	sData := *(*string)(unsafe.Pointer(&data))
 	switch arg := vPtr.(type) {

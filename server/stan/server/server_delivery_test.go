@@ -25,7 +25,6 @@ import (
 	"github.com/kubemq-io/broker/client/stan/pb"
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
 	"github.com/kubemq-io/broker/server/stan/stores"
-	"github.com/kubemq-io/broker/server/stan/test"
 )
 
 func testStalledDelivery(t *testing.T, typeSub string) {
@@ -258,21 +257,14 @@ func TestDeliveryWithGapsInSequence(t *testing.T) {
 }
 
 func TestPersistentStoreSQLSubsPendingRows(t *testing.T) {
+	// If user doesn't want to run any SQL tests, we need to bail.
 	if !doSQL {
-		t.SkipNow()
+		t.Skip()
 	}
-	source := testSQLSource
-	if persistentStoreType != stores.TypeSQL {
-		// If not running tests with `-persistent_store sql`,
-		// initialize few things and default to MySQL.
-		source = testDefaultMySQLSource
-		sourceAdmin := testDefaultMySQLSourceAdmin
-		if err := test.CreateSQLDatabase(testSQLDriver, sourceAdmin,
-			source, testSQLDatabaseName); err != nil {
-			t.Fatalf("Error setting up test for SQL: %v", err)
-		}
-		defer test.DeleteSQLDatabase(testSQLDriver, sourceAdmin, testSQLDatabaseName)
-	}
+	// Force persistent store to be SQL for this test.
+	orgps := persistentStoreType
+	persistentStoreType = stores.TypeSQL
+	defer func() { persistentStoreType = orgps }()
 
 	cleanupDatastore(t)
 	defer cleanupDatastore(t)
@@ -280,11 +272,8 @@ func TestPersistentStoreSQLSubsPendingRows(t *testing.T) {
 	ns := natsdTest.RunDefaultServer()
 	defer ns.Shutdown()
 
-	opts := GetDefaultOptions()
+	opts := getTestDefaultOptsForPersistentStore()
 	opts.NATSServerURL = "nats://127.0.0.1:4222"
-	opts.StoreType = stores.TypeSQL
-	opts.SQLStoreOpts.Driver = testSQLDriver
-	opts.SQLStoreOpts.Source = source
 	s := runServerWithOpts(t, opts, nil)
 	defer shutdownRestartedServerOnTestExit(&s)
 

@@ -391,7 +391,7 @@ func TestRequestsAcrossRoutesToQueues(t *testing.T) {
 }
 
 // This is in response to Issue #1144
-// https://github.com/nats-io/nats-server/issues/1144
+// https://github.com/kubemq-io/broker/server/gnatsd/issues/1144
 func TestQueueDistributionAcrossRoutes(t *testing.T) {
 	srvA, srvB, _, _ := runServers(t)
 	defer srvA.Shutdown()

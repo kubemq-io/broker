@@ -14,7 +14,10 @@
 package server
 
 import (
+	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -734,5 +737,131 @@ func TestDeleteChannelStoreError(t *testing.T) {
 	}
 	if tset {
 		t.Fatalf("Timer should have been stopped")
+	}
+}
+
+func TestCreateChannelError(t *testing.T) {
+	opts := GetDefaultOptions()
+	logger := &checkErrorLogger{checkErrorStr: "Creating channel \"foo\" failed: " + errOnPurpose.Error()}
+	opts.CustomLogger = logger
+	s := runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+
+	s.channels.Lock()
+	ms := &testChannelStoreFailStore{Store: s.channels.store}
+	s.channels.store = ms
+	s.channels.Unlock()
+
+	if _, err := s.channels.createChannel(s, "foo"); err == nil {
+		t.Fatal("Expected error, got none")
+	}
+	if !logger.gotError {
+		t.Fatal("Did not log the expected error")
+	}
+}
+
+type noSrvStateLogger struct {
+	dummyLogger
+	ch chan string
+}
+
+func (l *noSrvStateLogger) Warnf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if strings.Contains(msg, "not recovered") {
+		select {
+		case l.ch <- msg:
+		default:
+		}
+	}
+}
+
+func TestFileStoreServerStateMissing(t *testing.T) {
+	l := &noSrvStateLogger{ch: make(chan string, 1)}
+
+	// Force the storage to be FILE, regardless of persistent_store value.
+	opts := GetDefaultOptions()
+	opts.CustomLogger = l
+	opts.StoreType = stores.TypeFile
+	opts.FilestoreDir = defaultDataStore
+	opts.FileStoreOpts.BufferSize = 1024
+	if err := os.RemoveAll(defaultDataStore); err != nil {
+		t.Fatalf("Error cleaning up datastore: %v", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(defaultDataStore); err != nil {
+			t.Fatalf("Error cleaning up datastore: %v", err)
+		}
+	}()
+	s := runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+
+	if _, err := s.channels.createChannel(s, "foo"); err != nil {
+		t.Fatal("Expected error, got none")
+	}
+
+	s.Shutdown()
+	os.Remove(filepath.Join(defaultDataStore, "server.dat"))
+
+	s = runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+
+	if c := s.channels.get("foo"); c == nil {
+		t.Fatal("Expected channel to be recovered, was not")
+	}
+
+	select {
+	case <-l.ch: // OK
+	default:
+		t.Fatal("Did not get warning about non recovered server state")
+	}
+}
+
+func TestSQLStoreServerStateMissing(t *testing.T) {
+	// If user doesn't want to run any SQL tests, we need to bail.
+	if !doSQL {
+		t.Skip()
+	}
+	// Force persistent store to be SQL for this test.
+	orgps := persistentStoreType
+	persistentStoreType = stores.TypeSQL
+	defer func() { persistentStoreType = orgps }()
+
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+
+	l := &noSrvStateLogger{ch: make(chan string, 1)}
+
+	opts := getTestDefaultOptsForPersistentStore()
+	opts.CustomLogger = l
+	s := runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+
+	if _, err := s.channels.createChannel(s, "foo"); err != nil {
+		t.Fatal("Expected error, got none")
+	}
+
+	s.Shutdown()
+
+	db, err := sql.Open(testSQLDriver, testSQLSource)
+	if err != nil {
+		t.Fatalf("Error opening database: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("DELETE FROM ServerInfo"); err != nil {
+		t.Fatalf("Error deleting server info: %v", err)
+	}
+	db.Close()
+
+	s = runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+
+	if c := s.channels.get("foo"); c == nil {
+		t.Fatal("Expected channel to be recovered, was not")
+	}
+
+	select {
+	case <-l.ch: // OK
+	default:
+		t.Fatal("Did not get warning about non recovered server state")
 	}
 }

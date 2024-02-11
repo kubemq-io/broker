@@ -20,9 +20,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubemq-io/broker/pkg/nuid"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/stores"
+	"github.com/nats-io/nuid"
 )
 
 func createClientStore() *clientStore {

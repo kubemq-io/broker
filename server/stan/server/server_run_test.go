@@ -17,7 +17,6 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"runtime"
@@ -74,7 +73,7 @@ func TestRunServerFailureLogsCause(t *testing.T) {
 	}
 
 	// We should get a trace in the log
-	if !strings.Contains(d.fatal, "available for connection") {
+	if !strings.Contains(d.fatal, "Failed to start") {
 		t.Fatalf("Expected to get a cause as invalid connection, got: %v", d.msg)
 	}
 }
@@ -142,6 +141,7 @@ func TestEnsureStandAlone(t *testing.T) {
 
 	// Start a streaming server, and setup a route
 	nOpts := DefaultNatsServerOptions
+	nOpts.Cluster.Name = "abc"
 	nOpts.Cluster.ListenStr = "nats://127.0.0.1:5550"
 	nOpts.RoutesStr = "nats://127.0.0.1:5551"
 
@@ -155,6 +155,7 @@ func TestEnsureStandAlone(t *testing.T) {
 	// same cluster ID.  It should fail
 	nOpts2 := DefaultNatsServerOptions
 	nOpts2.Port = 4333
+	nOpts2.Cluster.Name = "abc"
 	nOpts2.Cluster.ListenStr = "nats://127.0.0.1:5551"
 	nOpts2.RoutesStr = "nats://127.0.0.1:5550"
 	s2, err := RunServerWithOpts(sOpts, &nOpts2)
@@ -1281,12 +1282,12 @@ func TestStreamingServerReadyLog(t *testing.T) {
 }
 
 func TestReopenLogFileStopsNATSDebugTrace(t *testing.T) {
-	tmpDir, err := ioutil.TempDir("", "nats-streaming-server")
+	tmpDir, err := os.MkdirTemp("", "nats-streaming-server")
 	if err != nil {
 		t.Fatal("Could not create tmp dir")
 	}
 	defer os.RemoveAll(tmpDir)
-	file, err := ioutil.TempFile(tmpDir, "log_")
+	file, err := os.CreateTemp(tmpDir, "log_")
 	if err != nil {
 		t.Fatalf("Could not create the temp file: %v", err)
 	}
@@ -1297,7 +1298,7 @@ func TestReopenLogFileStopsNATSDebugTrace(t *testing.T) {
 	nOpts.Debug = true
 	nOpts.Trace = true
 	nOpts.Logtime = true
-	nOpts.LogSizeLimit = 10 * 1024
+	nOpts.LogSizeLimit = 20 * 1024
 
 	sOpts := GetDefaultOptions()
 	// Ensure STAN debug and trace are set to false. This was the issue
@@ -1309,7 +1310,7 @@ func TestReopenLogFileStopsNATSDebugTrace(t *testing.T) {
 
 	check := func(str string, expected bool) {
 		t.Helper()
-		buf, err := ioutil.ReadFile(nOpts.LogFile)
+		buf, err := os.ReadFile(nOpts.LogFile)
 		if err != nil {
 			t.Fatalf("Error reading file: %v", err)
 		}
@@ -1350,7 +1351,7 @@ func TestReopenLogFileStopsNATSDebugTrace(t *testing.T) {
 		s.log.Noticef(pstr)
 	}
 	// Check that size limit has been applied.
-	files, err := ioutil.ReadDir(tmpDir)
+	files, err := os.ReadDir(tmpDir)
 	if err != nil {
 		t.Fatalf("Error reading directory: %v", err)
 	}

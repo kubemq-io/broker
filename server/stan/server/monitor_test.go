@@ -18,12 +18,14 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"net/http"
+	"os"
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -67,8 +69,8 @@ func runMonitorServer(t *testing.T, sOpts *Options) *StanServer {
 	return runServerWithOpts(t, sOpts, &nOpts)
 }
 
-func getBodyEx(t *testing.T, client *http.Client, scheme, endpoint string, expectedStatus int, expectedContentType string) (*http.Response, []byte) {
-	url := fmt.Sprintf("%s://%s:%d%s", scheme, monitorHost, monitorPort, endpoint)
+func getBodyEx(t *testing.T, client *http.Client, scheme, endpoint string, mp, expectedStatus int, expectedContentType string) (*http.Response, []byte) {
+	url := fmt.Sprintf("%s://%s:%d%s", scheme, monitorHost, mp, endpoint)
 	resp, err := client.Get(url)
 	if err != nil {
 		stackFatalf(t, "Expected no error: Got %v\n", err)
@@ -80,7 +82,7 @@ func getBodyEx(t *testing.T, client *http.Client, scheme, endpoint string, expec
 	if ct != expectedContentType {
 		stackFatalf(t, "Expected %s content-type, got %s\n", expectedContentType, ct)
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		resp.Body.Close()
 		stackFatalf(t, "Got an error reading the body: %v\n", err)
@@ -89,7 +91,7 @@ func getBodyEx(t *testing.T, client *http.Client, scheme, endpoint string, expec
 }
 
 func getBody(t *testing.T, endpoint, expectedContentType string) (*http.Response, []byte) {
-	return getBodyEx(t, http.DefaultClient, "http", endpoint, http.StatusOK, expectedContentType)
+	return getBodyEx(t, http.DefaultClient, "http", endpoint, monitorPort, http.StatusOK, expectedContentType)
 }
 
 func monitorExpectStatusEx(t *testing.T, client *http.Client, scheme, endpoint string, expectedStatus int) {
@@ -154,7 +156,7 @@ func TestMonitorStartOwnHTTPSServer(t *testing.T) {
 	defer s.Shutdown()
 
 	tlsConfig := &tls.Config{}
-	caCert, err := ioutil.ReadFile("../test/certs/ca.pem")
+	caCert, err := os.ReadFile("../test/certs/ca.pem")
 	if err != nil {
 		t.Fatalf("Got error reading RootCA file: %s", err)
 	}
@@ -164,7 +166,7 @@ func TestMonitorStartOwnHTTPSServer(t *testing.T) {
 	transport := &http.Transport{TLSClientConfig: tlsConfig}
 	httpClient := &http.Client{Transport: transport}
 
-	r, _ := getBodyEx(t, httpClient, "https", RootPath, http.StatusOK, expectedText)
+	r, _ := getBodyEx(t, httpClient, "https", RootPath, monitorPort, http.StatusOK, expectedText)
 	r.Body.Close()
 }
 
@@ -413,7 +415,7 @@ func TestMonitorIsFTActiveFTServer(t *testing.T) {
 			standby := runServerWithOpts(t, opts, sNOpts)
 			defer standby.Shutdown()
 
-			resp, _ := getBodyEx(t, http.DefaultClient, "http", IsFTActivePath, test.expectedStatus, "")
+			resp, _ := getBodyEx(t, http.DefaultClient, "http", IsFTActivePath, monitorPort, test.expectedStatus, "")
 			defer resp.Body.Close()
 		})
 	}
@@ -634,8 +636,9 @@ func TestMonitorClientsz(t *testing.T) {
 			cli := s.clients.lookup(cid)
 			cli.RLock()
 			cz := &Clientz{
-				ID:      cid,
-				HBInbox: cli.info.HbInbox,
+				ID:        cid,
+				HBInbox:   cli.info.HbInbox,
+				SubsCount: len(cli.subs),
 			}
 			if expectSubs {
 				cz.Subscriptions = getCliSubs(cli.subs)
@@ -761,8 +764,9 @@ func TestMonitorClientz(t *testing.T) {
 		}
 		cli.RLock()
 		cz := &Clientz{
-			ID:      cid,
-			HBInbox: cli.info.HbInbox,
+			ID:        cid,
+			HBInbox:   cli.info.HbInbox,
+			SubsCount: len(cli.subs),
 		}
 		if expectSubs {
 			cz.Subscriptions = getCliSubs(cli.subs)
@@ -985,6 +989,7 @@ func TestMonitorChannelsWithSubsz(t *testing.T) {
 					qsub.RUnlock()
 				}
 				ss.RUnlock()
+				channelz.SubsCount = len(subscriptions)
 				channelz.Subscriptions = subscriptions
 				channelsz.Channels = append(channelsz.Channels, channelz)
 			}
@@ -1075,16 +1080,18 @@ func TestMonitorChannelz(t *testing.T) {
 		}
 		msgs, bytes := msgStoreState(t, cs.store.Msgs)
 		firstSeq, lastSeq := msgStoreFirstAndLastSequence(t, cs.store.Msgs)
+		ss := cs.ss
+		subs := getChannelSubs(ss.psubs)
 		channelz := &Channelz{
-			Name:     name,
-			FirstSeq: firstSeq,
-			LastSeq:  lastSeq,
-			Msgs:     msgs,
-			Bytes:    bytes,
+			Name:      name,
+			FirstSeq:  firstSeq,
+			LastSeq:   lastSeq,
+			Msgs:      msgs,
+			Bytes:     bytes,
+			SubsCount: len(subs),
 		}
 		if expectedSubs {
-			ss := cs.ss
-			channelz.Subscriptions = getChannelSubs(ss.psubs)
+			channelz.Subscriptions = subs
 		}
 		return channelz
 	}
@@ -1245,7 +1252,7 @@ func TestMonitorClusterRole(t *testing.T) {
 			s2 := runServerWithOpts(t, s2sOpts, test.n2Opts)
 			defer s2.Shutdown()
 
-			getLeader(t, 10*time.Second, s1, s2)
+			l := getLeader(t, 10*time.Second, s1, s2)
 
 			resp, body := getBody(t, ServerPath, expectedJSON)
 			resp.Body.Close()
@@ -1255,6 +1262,17 @@ func TestMonitorClusterRole(t *testing.T) {
 			}
 			if sz.Role != test.expectedRole {
 				t.Fatalf("Expected role to be %v, got %v", test.expectedRole, sz.Role)
+			}
+			var nodeID string
+			if test.name == "leader" {
+				nodeID = l.info.NodeID
+			} else if l == s1 {
+				nodeID = s2.info.NodeID
+			} else {
+				nodeID = s1.info.NodeID
+			}
+			if sz.NodeID != nodeID {
+				t.Fatalf("Expected nodeID to be %q, got %q", nodeID, sz.NodeID)
 			}
 		})
 	}
@@ -1431,4 +1449,68 @@ func TestMonitorInOutMsgs(t *testing.T) {
 	if sz.OutMsgs != 15 || sz.OutBytes == 0 {
 		t.Fatalf("Expected 15 outbound messages, got %v - %v", sz.InMsgs, sz.InBytes)
 	}
+}
+
+func TestMonitorNoPanicOnServerRestart(t *testing.T) {
+	resetPreviousHTTPConnections()
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	opts := getTestDefaultOptsForPersistentStore()
+
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	opts.NATSServerURL = "nats://127.0.0.1:4222"
+	s := runMonitorServer(t, opts)
+	defer s.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	for i := 0; i < 100; i++ {
+		if _, err := sc.Subscribe(fmt.Sprintf("foo.%d", i+1),
+			func(_ *stan.Msg) {}, stan.DurableName("dur")); err != nil {
+			t.Fatalf("Error on subscribe: %v", err)
+		}
+	}
+
+	endpoints := []string{
+		"channelsz?subs=1",
+		"serverz",
+		"storez",
+		"clientsz",
+		"isFTActive",
+	}
+	for _, e := range endpoints {
+		s.Shutdown()
+
+		wg := sync.WaitGroup{}
+		wg.Add(1)
+		done := make(chan struct{})
+		go func() {
+			defer wg.Done()
+			url := fmt.Sprintf("http://%s:%d/streaming/", monitorHost, monitorPort)
+			for {
+				resp, err := http.DefaultClient.Get(url + e)
+				if err != nil {
+					continue
+				}
+				io.ReadAll(resp.Body)
+				resp.Body.Close()
+				select {
+				case <-done:
+					return
+				default:
+				}
+			}
+		}()
+
+		s = runMonitorServer(t, opts)
+		defer s.Shutdown()
+
+		time.Sleep(100 * time.Millisecond)
+		close(done)
+		wg.Wait()
+	}
+	sc.Close()
 }

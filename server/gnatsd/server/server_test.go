@@ -30,7 +30,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
+	"github.com/kubemq-io/broker/client/nats"
 )
 
 func checkFor(t *testing.T, totalWait, sleepDur time.Duration, f func() error) {

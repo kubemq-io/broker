@@ -1,4 +1,4 @@
-// Copyright 2016-2019 The NATS Authors
+// Copyright 2016-2021 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,7 +16,6 @@ package server
 import (
 	"bytes"
 	"flag"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"runtime"
@@ -275,6 +274,15 @@ func TestParseConfig(t *testing.T) {
 	if !opts.Clustering.AllowAddRemoveNode {
 		t.Fatal("Expected AllowAddRemoveNode to be true")
 	}
+	if !opts.Clustering.BoltFreeListSync {
+		t.Fatal("Expected BoltFreeListSync to be true")
+	}
+	if !opts.Clustering.BoltFreeListMap {
+		t.Fatal("Expected BoltFreeListMap to be true")
+	}
+	if !opts.Clustering.NodesConnections {
+		t.Fatal("Expected NodesConnections to be true")
+	}
 	if opts.SQLStoreOpts.Driver != "mysql" {
 		t.Fatalf("Expected SQL Driver to be %q, got %q", "mysql", opts.SQLStoreOpts.Driver)
 	}
@@ -286,6 +294,9 @@ func TestParseConfig(t *testing.T) {
 	}
 	if opts.SQLStoreOpts.MaxOpenConns != 5 {
 		t.Fatalf("Expected SQL MaxOpenConns to be 5, got %v", opts.SQLStoreOpts.MaxOpenConns)
+	}
+	if opts.SQLStoreOpts.BulkInsertLimit != 1000 {
+		t.Fatalf("Expected SQL BulkInsertLimit to be 1000, got %v", opts.SQLStoreOpts.BulkInsertLimit)
 	}
 	if !opts.Encrypt {
 		t.Fatal("Expected Encrypt to be true")
@@ -302,11 +313,11 @@ func TestParsePermError(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.SkipNow()
 	}
-	tmpDir, err := ioutil.TempDir("", "streaming")
+	tmpDir, err := os.MkdirTemp("", "streaming")
 	if err != nil {
 		t.Fatalf("Could not create tmp dir: %v", err)
 	}
-	file, err := ioutil.TempFile(tmpDir, "config.conf")
+	file, err := os.CreateTemp(tmpDir, "config.conf")
 	if err != nil {
 		t.Fatalf("Could not create tmp file: %v", err)
 	}
@@ -327,7 +338,7 @@ func TestParsePermError(t *testing.T) {
 
 func TestParseParserError(t *testing.T) {
 	confFile := "wrong_config.conf"
-	if err := ioutil.WriteFile(confFile, []byte("x=."), 0660); err != nil {
+	if err := os.WriteFile(confFile, []byte("x=."), 0660); err != nil {
 		t.Fatalf("Unexpected error creating conf file: %v", err)
 	}
 	defer os.Remove(confFile)
@@ -339,7 +350,7 @@ func TestParseParserError(t *testing.T) {
 
 func TestParseStoreType(t *testing.T) {
 	confFile := "wrong_config.conf"
-	if err := ioutil.WriteFile(confFile, []byte("store=memory"), 0660); err != nil {
+	if err := os.WriteFile(confFile, []byte("store=memory"), 0660); err != nil {
 		t.Fatalf("Unexpected error creating conf file: %v", err)
 	}
 	defer os.Remove(confFile)
@@ -352,7 +363,7 @@ func TestParseStoreType(t *testing.T) {
 	}
 	os.Remove(confFile)
 
-	if err := ioutil.WriteFile(confFile, []byte("store=xyz"), 0660); err != nil {
+	if err := os.WriteFile(confFile, []byte("store=xyz"), 0660); err != nil {
 		t.Fatalf("Unexpected error creating conf file: %v", err)
 	}
 	defer os.Remove(confFile)
@@ -368,7 +379,7 @@ func TestParseStoreType(t *testing.T) {
 		stores.TypeSQL,
 	}
 	for _, gs := range goodStores {
-		if err := ioutil.WriteFile(confFile, []byte("store="+gs), 0660); err != nil {
+		if err := os.WriteFile(confFile, []byte("store="+gs), 0660); err != nil {
 			t.Fatalf("Unexpected error creating conf file: %v", err)
 		}
 		defer os.Remove(confFile)
@@ -386,7 +397,7 @@ func TestParseStoreType(t *testing.T) {
 func TestParsePerChannelLimitsSetToZero(t *testing.T) {
 	confFile := "config.conf"
 	defer os.Remove(confFile)
-	if err := ioutil.WriteFile(confFile,
+	if err := os.WriteFile(confFile,
 		[]byte("store_limits: {channels: {foo: {max_msgs: 0, max_bytes: 0, max_age: \"0\", max_subs: 0, max_inactivity: \"0\"}}}"), 0660); err != nil {
 		t.Fatalf("Unexpected error creating conf file: %v", err)
 	}
@@ -440,6 +451,7 @@ func TestParseWrongTypes(t *testing.T) {
 	expectFailureFor(t, "ft_group: 123", wrongTypeErr)
 	expectFailureFor(t, "partitioning: 123", wrongTypeErr)
 	expectFailureFor(t, "syslog_name: 123", wrongTypeErr)
+	expectFailureFor(t, "replace_durable: 123", wrongTypeErr)
 	expectFailureFor(t, "store_limits:{max_channels:false}", wrongTypeErr)
 	expectFailureFor(t, "store_limits:{max_msgs:false}", wrongTypeErr)
 	expectFailureFor(t, "store_limits:{max_bytes:false}", wrongTypeErr)
@@ -501,6 +513,8 @@ func TestParseWrongTypes(t *testing.T) {
 	expectFailureFor(t, "cluster:{raft_commit_timeout:123}", wrongTypeErr)
 	expectFailureFor(t, "cluster:{raft_commit_timeout:\"not_a_time\"}", wrongTimeErr)
 	expectFailureFor(t, "cluster:{allow_add_remove_node:1}", wrongTypeErr)
+	expectFailureFor(t, "cluster:{bolt_free_list_sync:123}", wrongTypeErr)
+	expectFailureFor(t, "cluster:{bolt_free_list_map:123}", wrongTypeErr)
 	expectFailureFor(t, "sql:{driver:false}", wrongTypeErr)
 	expectFailureFor(t, "sql:{source:false}", wrongTypeErr)
 	expectFailureFor(t, "sql:{no_caching:123}", wrongTypeErr)
@@ -517,7 +531,7 @@ func TestParseWrongTypes(t *testing.T) {
 
 func expectFailureFor(t *testing.T, content, errorMatch string) {
 	confFile := "wrong_config.conf"
-	if err := ioutil.WriteFile(confFile, []byte(content), 0660); err != nil {
+	if err := os.WriteFile(confFile, []byte(content), 0660); err != nil {
 		t.Fatalf("Unexpected error creating conf file: %v", err)
 	}
 	defer os.Remove(confFile)
@@ -622,7 +636,7 @@ func TestParseConfigureOptions(t *testing.T) {
 		streaming: {
 			cluster_id: my_cluster
 		}`)
-	if err := ioutil.WriteFile(sconf, scontent, 0660); err != nil {
+	if err := os.WriteFile(sconf, scontent, 0660); err != nil {
 		t.Fatalf("Error creating conf file: %v", err)
 	}
 	ncontent := []byte(`
@@ -630,7 +644,7 @@ func TestParseConfigureOptions(t *testing.T) {
 		streaming: {
 			cluster_id: my_cluster_2
 		}`)
-	if err := ioutil.WriteFile(nconf, ncontent, 0660); err != nil {
+	if err := os.WriteFile(nconf, ncontent, 0660); err != nil {
 		t.Fatalf("Error creating conf file: %v", err)
 	}
 	sopts, nopts := mustNotFail([]string{"-sc", sconf, "-c", nconf})
@@ -685,7 +699,7 @@ func TestParseConfigureOptions(t *testing.T) {
 		} else {
 			ncontent = []byte(`logtime: true`)
 		}
-		if err := ioutil.WriteFile(nconf, ncontent, 0660); err != nil {
+		if err := os.WriteFile(nconf, ncontent, 0660); err != nil {
 			t.Fatalf("Error creating conf file: %v", err)
 		}
 		_, nopts = mustNotFail([]string{"-c", nconf})

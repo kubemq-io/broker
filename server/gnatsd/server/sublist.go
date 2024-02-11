@@ -99,7 +99,7 @@ func newLevel() *level {
 
 // In general caching is recommended however in some extreme cases where
 // interest changes are high, suppressing the cache can help.
-// https://github.com/nats-io/nats-server/issues/941
+// https://github.com/kubemq-io/broker/server/gnatsd/issues/941
 // FIXME(dlc) - should be more dynamic at some point based on cache thrashing.
 
 // NewSublist will create a default sublist with caching enabled per the flag.

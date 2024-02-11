@@ -1,4 +1,4 @@
-// Copyright 2016-2019 The NATS Authors
+// Copyright 2016-2021 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -26,6 +26,7 @@ import (
 	natsdTest "github.com/kubemq-io/broker/server/gnatsd/test"
 	"github.com/kubemq-io/broker/server/stan/spb"
 	"github.com/kubemq-io/broker/server/stan/stores"
+	"github.com/nats-io/nuid"
 )
 
 func TestSubscribeShrink(t *testing.T) {
@@ -731,6 +732,11 @@ func TestAckTimerSetOnStalledSub(t *testing.T) {
 }
 
 func TestPersistentStoreNonDurableSubRemovedOnConnClose(t *testing.T) {
+	// If user doesn't want to run any SQL tests, we will do the filestore only
+	// and need to bail if the persistent store type is set to SQL.
+	if !doSQL && persistentStoreType == stores.TypeSQL {
+		t.Skip()
+	}
 	cleanupDatastore(t)
 	defer cleanupDatastore(t)
 
@@ -1280,4 +1286,139 @@ func TestNumSubsOnSubFailure(t *testing.T) {
 	checkNumSubs(t, s, 2)
 	sc.Close()
 	checkNumSubs(t, s, 2)
+}
+
+// This test simulates a client library that would get a timeout on subscribe,
+// and will send an subscription close request with the inbox, not the ack inbox
+// since the library did not get the response back. This test checks that
+// the subscription is properly removed.
+func TestSubCloseByInbox(t *testing.T) {
+	s := runServer(t, clusterName)
+	defer s.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	nc := sc.NatsConn()
+
+	// Send raw subscription request, followed by a subscription close with the inbox.
+	inbox := nats.NewInbox()
+	subReq := &pb.SubscriptionRequest{
+		ClientID:    clientName,
+		Subject:     "foo",
+		Inbox:       inbox,
+		MaxInFlight: 1,
+	}
+	b, _ := subReq.Marshal()
+	resp, err := nc.Request(s.info.Subscribe, b, time.Second)
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	subResp := &pb.SubscriptionResponse{}
+	subResp.Unmarshal(resp.Data)
+	if subResp.Error != "" {
+		t.Fatalf("Error on subscribe: %v", subResp.Error)
+	}
+
+	// Now simulate the case where the library would instead have got a timeout
+	// and sent a subscription close request with the inbox (instead of AckInbox)
+	// since it would not have it.
+	subCloseReq := &pb.UnsubscribeRequest{
+		ClientID: clientName,
+		Subject:  "foo",
+		// Normally, the library sends the AckInbox here that it gets from the
+		// subscription response, but in case of timeout, it would not have it.
+		Inbox: inbox,
+	}
+	b, _ = subCloseReq.Marshal()
+	resp, err = nc.Request(s.info.SubClose, b, time.Second)
+	if err != nil {
+		t.Fatalf("Error on subscription close: %v", err)
+	}
+	subResp = &pb.SubscriptionResponse{}
+	subResp.Unmarshal(resp.Data)
+	if subResp.Error != "" {
+		t.Fatalf("Error on subscription close: %v", subResp.Error)
+	}
+
+	// Now verify that the subscription has correctly been removed
+	subs := s.clients.getSubs(clientName)
+	if len(subs) != 0 {
+		t.Fatalf("Should not be any subscription, got %v", subs)
+	}
+}
+
+func TestSubRequestsFailedIfClientClosed(t *testing.T) {
+	sOpts := GetDefaultOptions()
+	sOpts.ID = clusterName
+	sOpts.ClientHBInterval = 15 * time.Millisecond
+	sOpts.ClientHBTimeout = 15 * time.Millisecond
+	sOpts.ClientHBFailCount = 1
+	sOpts.StoreLimits.SubStoreLimits.MaxSubscriptions = 0
+	nOpts := DefaultNatsServerOptions
+	s := runServerWithOpts(t, sOpts, &nOpts)
+	defer s.Shutdown()
+
+	// Use a bare NATS connection to send incorrect requests
+	nc, err := nats.Connect(nats.DefaultURL)
+	if err != nil {
+		t.Fatalf("Unexpected error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	sub, err := nc.SubscribeSync("subreply")
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	sub.SetPendingLimits(-1, -1)
+
+	req := &pb.ConnectRequest{ClientID: clientName, HeartbeatInbox: "hbInbox"}
+	b, _ := req.Marshal()
+	resp, err := nc.Request(s.info.Discovery, b, time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error on publishing request: %v", err)
+	}
+	r := &pb.ConnectResponse{}
+	err = r.Unmarshal(resp.Data)
+	if err != nil {
+		t.Fatalf("Unexpected response object: %v", err)
+	}
+	if r.Error != "" {
+		t.Fatalf("Unexpected error: %v", r.Error)
+	}
+
+	s.channels.Lock()
+
+	for i := 0; i < 1000; i++ {
+		req := &pb.SubscriptionRequest{
+			ClientID:      clientName,
+			Subject:       "foo",
+			Inbox:         nuid.Next(),
+			MaxInFlight:   1,
+			AckWaitInSecs: 30,
+		}
+		b, _ := req.Marshal()
+		if err := nc.PublishRequest(s.info.Subscribe, sub.Subject, b); err != nil {
+			t.Fatalf("Error on request: %v", err)
+		}
+	}
+
+	s.channels.Unlock()
+
+	for {
+		msg, err := sub.NextMsg(250 * time.Millisecond)
+		if err != nil {
+			break
+		}
+
+		rply := &pb.SubscriptionResponse{}
+		rply.Unmarshal(msg.Data)
+		if rply.Error == "" {
+			continue
+		}
+		if rply.Error != ErrUnknownClient.Error() {
+			t.Fatalf("Expected error %q, got %q", ErrUnknownClient, rply.Error)
+		}
+		break
+	}
 }

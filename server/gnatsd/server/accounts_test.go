@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
+	"github.com/kubemq-io/broker/client/nats"
 	"github.com/nats-io/nkeys"
 )
 
@@ -706,7 +706,7 @@ func TestSimpleMapping(t *testing.T) {
 	}
 }
 
-// https://github.com/nats-io/nats-server/issues/1159
+// https://github.com/kubemq-io/broker/server/gnatsd/issues/1159
 func TestStreamImportLengthBug(t *testing.T) {
 	s, fooAcc, barAcc := simpleAccountServer(t)
 	defer s.Shutdown()

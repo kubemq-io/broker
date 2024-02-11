@@ -32,7 +32,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 
-	"github.com/nats-io/nats.go"
+	"github.com/kubemq-io/broker/client/nats"
 )
 
 type serverInfo struct {
