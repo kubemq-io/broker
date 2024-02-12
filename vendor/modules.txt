@@ -30,9 +30,6 @@ github.com/hashicorp/golang-lru/simplelru
 # github.com/hashicorp/raft v1.6.0
 ## explicit; go 1.20
 github.com/hashicorp/raft
-# github.com/klauspost/compress v1.17.5
-## explicit; go 1.19
-github.com/klauspost/compress/flate
 # github.com/lib/pq v1.10.9
 ## explicit; go 1.13
 github.com/lib/pq
@@ -47,12 +44,6 @@ github.com/mattn/go-isatty
 # github.com/nats-io/jwt/v2 v2.5.3
 ## explicit; go 1.18
 github.com/nats-io/jwt/v2
-# github.com/nats-io/nats.go v1.32.0
-## explicit; go 1.20
-github.com/nats-io/nats.go
-github.com/nats-io/nats.go/encoders/builtin
-github.com/nats-io/nats.go/internal/parser
-github.com/nats-io/nats.go/util
 # github.com/nats-io/nkeys v0.4.7
 ## explicit; go 1.20
 github.com/nats-io/nkeys
@@ -74,6 +65,8 @@ golang.org/x/crypto/blake2b
 golang.org/x/crypto/blowfish
 golang.org/x/crypto/chacha20
 golang.org/x/crypto/chacha20poly1305
+golang.org/x/crypto/cryptobyte
+golang.org/x/crypto/cryptobyte/asn1
 golang.org/x/crypto/curve25519
 golang.org/x/crypto/curve25519/internal/field
 golang.org/x/crypto/ed25519
@@ -81,6 +74,7 @@ golang.org/x/crypto/internal/alias
 golang.org/x/crypto/internal/poly1305
 golang.org/x/crypto/nacl/box
 golang.org/x/crypto/nacl/secretbox
+golang.org/x/crypto/ocsp
 golang.org/x/crypto/salsa20/salsa
 # golang.org/x/sys v0.16.0
 ## explicit; go 1.18

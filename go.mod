@@ -11,7 +11,6 @@ require (
 	github.com/hashicorp/raft v1.6.0
 	github.com/lib/pq v1.10.9
 	github.com/nats-io/jwt/v2 v2.5.3
-	github.com/nats-io/nats.go v1.32.0
 	github.com/nats-io/nkeys v0.4.7
 	github.com/nats-io/nuid v1.0.1
 	github.com/prometheus/procfs v0.0.8
@@ -26,7 +25,6 @@ require (
 	github.com/fatih/color v1.16.0 // indirect
 	github.com/hashicorp/go-immutable-radix v1.3.1 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
-	github.com/klauspost/compress v1.17.5 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 )
